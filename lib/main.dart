@@ -1,17 +1,26 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
+import 'package:cryptography/cryptography.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:local_peer_connections/local_peer_connections.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
+const _friendRequest = 1,
+    _friendAccept = 2,
+    _friendReject = 3,
+    _friendRemove = 4,
+    _invite = 0x10,
+    _chat = 0x20;
 void main() => runApp(const LocalPeerMessagesApp());
 
 class LocalPeerMessagesApp extends StatelessWidget {
   const LocalPeerMessagesApp({super.key});
-
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'Local Peer Messages',
+    title: 'LPC Demo Messenger',
     theme: ThemeData(
       colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
     ),
@@ -26,257 +35,1262 @@ class MessagingPage extends StatefulWidget {
 }
 
 class _MessagingPageState extends State<MessagingPage> {
+  static const _permissions = MethodChannel('local_peer_messages/permissions');
+  final _friends = <String, _Friend>{},
+      _nearby = <String, DiscoveredEndpoint>{},
+      _unnamedNearby = <String, DiscoveredEndpoint>{},
+      _identifiedEndpointNames = <String, String>{},
+      _endpointPeers = <String, PeerConnection>{},
+      _endpointSeenAt = <String, DateTime>{},
+      _connectUiStates = <String, _ConnectUiState>{},
+      _connections = <String, PeerConnection>{},
+      _unreadByFriend = <String, int>{},
+      _pending = <String, Set<String>>{},
+      _handled = <String>{},
+      _logs = <String>[];
+  final _lines = <_Line>[];
+  final _identifyingEndpoints = <String>{};
+  final _inboundFriendRequests = <String>{};
+  final _friendRequestTimers = <String, Timer>{};
+  final _expandedChats = <String>{}, _newFriends = <String>{};
+  final _lastEndpointLog = <String, DateTime>{};
+  final _direct = TextEditingController(), _groupText = TextEditingController();
+  final _selected = <String>{};
+  final _random = Random.secure();
   NearbyRuntime? _runtime;
+  HostSession? _host;
   DiscoverySession? _discovery;
-  final _text = TextEditingController();
-  final _attempts = <String, ConnectionAttempt>{};
-  final _connections = <String, PeerConnection>{};
-  final _messages = <_ChatLine>[];
-  String _status = 'Starting…';
+  GroupSession? _group;
+  Uint8List? _groupDemoId;
+  StreamSubscription<PlatformBleEvent>? _backendSub;
+  StreamSubscription<RuntimeEvent>? _runtimeSub;
+  StreamSubscription<GroupEvent>? _groupSub;
+  Timer? _endpointExpiryTimer;
+  final _peerSubs = <StreamSubscription<dynamic>>[];
+  String _name = '', _status = 'Starting…';
+  int _tab = 0;
 
   @override
   void initState() {
     super.initState();
+    _endpointExpiryTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => _expireEndpoints(),
+    );
     unawaited(_start());
+  }
+
+  void _expireEndpoints() {
+    final cutoff = DateTime.now().subtract(const Duration(seconds: 8));
+    final expired = _endpointSeenAt.entries
+        .where((entry) => entry.value.isBefore(cutoff))
+        .map((entry) => entry.key)
+        .toList(growable: false);
+    if (expired.isEmpty) return;
+    setState(() {
+      for (final endpointId in expired) {
+        _endpointSeenAt.remove(endpointId);
+        _nearby.remove(endpointId);
+        _unnamedNearby.remove(endpointId);
+        _identifiedEndpointNames.remove(endpointId);
+        _endpointPeers.remove(endpointId);
+        _connectUiStates.remove(endpointId);
+        _identifyingEndpoints.remove(endpointId);
+      }
+    });
+    _log('Removed ${expired.length} stale discovery endpoint(s)');
+  }
+
+  void _log(String message) {
+    final now = DateTime.now();
+    final timestamp = now.toIso8601String().substring(11, 23);
+    _logs.insert(0, '$timestamp  $message');
+    if (_logs.length > 100) _logs.removeLast();
+    debugPrint('[LPC Demo][$timestamp] $message');
+  }
+
+  bool _shouldLogEndpoint(String endpointId) {
+    final now = DateTime.now();
+    final previous = _lastEndpointLog[endpointId];
+    if (previous != null &&
+        now.difference(previous) < const Duration(seconds: 5)) {
+      return false;
+    }
+    _lastEndpointLog[endpointId] = now;
+    return true;
   }
 
   Future<void> _start() async {
     try {
-      final runtime = await NearbyRuntime.create(
-        platformBleBackend: PlatformBleBackend(),
-      );
-      _runtime = runtime;
-      if (mounted) setState(() => _status = 'Ready');
-    } catch (error) {
-      if (mounted) setState(() => _status = 'Startup failed: $error');
-    }
-  }
-
-  Future<void> _discover() async {
-    if (_runtime == null) return;
-    try {
-      final discovery = await _runtime!.startDiscovery();
-      if (mounted) {
-        setState(() {
-          _discovery = discovery;
-          _status = 'Scanning';
-        });
+      final prefs = await SharedPreferences.getInstance();
+      _name = _validName(prefs.getString('local_display_name')) ?? _alias();
+      await prefs.setString('local_display_name', _name);
+      for (final raw
+          in prefs.getStringList('friend_records') ?? const <String>[]) {
+        final f = _Friend.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+        _friends[f.peerId] = f;
       }
-    } catch (error) {
-      if (mounted) setState(() => _status = 'Scan failed: $error');
-    }
-  }
-
-  Future<void> _advertise() async {
-    if (_runtime == null) return;
-    try {
-      final host = _runtime!.createHostSession(HostConfig(autoAccept: true));
-      await host.startAdvertising();
-      host.events.listen((event) {
-        if (event case HostPeerConnected(:final connection)) {
-          _attach(connection);
+      final backend = PlatformBleBackend();
+      _runtime = await NearbyRuntime.create(
+        platformBleBackend: backend,
+        config: RuntimeConfig(
+          discoveryDisplayName: _name,
+          applicationMetadata: _metadata(_name),
+          trustMode: HandshakeTrustMode.tofu,
+          autoReconnect: true,
+          autoConnectKnownPeers: true,
+          knownPeerResolver: _Resolver(_friends),
+          maxConcurrentKnownPeerProbes: 4,
+          maxPendingKnownPeerProbes: 64,
+          knownPeerLookupTimeoutMs: 2000,
+          maxKnownPeerCacheEntries: 256,
+          enableGatt: true,
+          enableL2cap: true,
+          enableLan: true,
+        ),
+      );
+      _runtimeSub = _runtime!.events.listen(_runtimeEvent);
+      _backendSub = backend.events.listen(_platformEvent);
+      if (!await _permission()) return;
+      _host = _runtime!.createHostSession(
+        HostConfig(
+          maxPeers: 7,
+          autoAccept: true,
+          trustMode: HandshakeTrustMode.tofu,
+        ),
+      );
+      _host!.events.listen((e) {
+        if (e is HostPeerConnected) {
+          _onHostPeerConnected(e.connection, e.discoveryEndpointId);
         }
       });
-      if (mounted) setState(() => _status = 'Advertising');
-    } catch (error) {
-      if (mounted) setState(() => _status = 'Advertise failed: $error');
+      await _host!.startAdvertising();
+      _discovery = await _runtime!.startDiscovery();
+      _log('Runtime started: symmetric advertising/listening and discovery');
+      if (mounted) setState(() => _status = 'Nearby discovery active');
+    } catch (e) {
+      _log('Startup failed: $e');
+      if (mounted) setState(() => _status = 'Startup failed: $e');
     }
   }
 
-  void _connect(DiscoveredEndpoint endpoint) {
-    if (_runtime == null || _attempts.containsKey(endpoint.id)) return;
+  void _onHostPeerConnected(PeerConnection peer, String? endpointId) {
+    if (endpointId != null) _endpointPeers[endpointId] = peer;
+    _attach(peer, 'PeerConnected');
+    // An inbound connection used solely by the remote device's automatic
+    // discovery identification must not keep the persistent HostSession
+    // reconnecting forever. Keep it long enough for a real FRIEND_REQUEST to
+    // arrive, then release only HostSession ownership if no relationship flow
+    // began.
+    Timer(const Duration(seconds: 8), () {
+      final id = peer.peerId.toString();
+      if (_friends.containsKey(id) || _inboundFriendRequests.contains(id)) {
+        return;
+      }
+      if (peer.state == PeerConnectionState.ready) {
+        _log('Releasing idle unknown inbound peer $id');
+        unawaited(
+          _host?.disconnect(peer.peerId, reason: 'IDENTIFICATION_COMPLETE'),
+        );
+      }
+    });
+  }
+
+  Future<bool> _permission() async {
     try {
-      final attempt = _runtime!.connect(endpoint.id);
-      _attempts[endpoint.id] = attempt;
-      attempt.events.listen((event) {
-        switch (event) {
-          case ConnectionAttemptConnected(:final connection):
-            _attempts.remove(endpoint.id);
-            _attach(connection);
-          case ConnectionAttemptFailed(:final error):
-            _attempts.remove(endpoint.id);
-            if (mounted) setState(() => _status = 'Connection failed: $error');
-          case ConnectionAttemptCancelled():
-            _attempts.remove(endpoint.id);
-          case PeerVerificationRequired(:final peerId, :final sas):
-            unawaited(_verifyPeer(attempt, peerId, sas));
+      final ok = await _permissions.invokeMethod<bool>(
+        'requestBluetoothPermissions',
+      );
+      return ok != false;
+    } on MissingPluginException {
+      return true;
+    }
+  }
+
+  void _platformEvent(PlatformBleEvent e) {
+    if (e is PlatformEndpointFound) {
+      _endpointSeenAt[e.endpointId] = DateTime.now();
+      final name = _validName(e.localName);
+      if (name == null) {
+        final identifiedName = _identifiedEndpointNames[e.endpointId];
+        if (identifiedName != null) {
+          if (mounted) {
+            setState(
+              () => _nearby[e.endpointId] = DiscoveredEndpoint(
+                e.endpointId,
+                rssi: e.rssi,
+                localName: identifiedName,
+              ),
+            );
+          }
+          return;
+        }
+        // Android cannot provide an app-specific local name in an individual
+        // BLE advertisement. Retain only an ephemeral endpoint for this
+        // explicit identification flow; never display or persist its opaque
+        // platform address/identifier as an identity.
+        final isNewUnidentifiedEndpoint = !_unnamedNearby.containsKey(
+          e.endpointId,
+        );
+        if (mounted && isNewUnidentifiedEndpoint) {
+          setState(() {
+            _unnamedNearby[e.endpointId] = DiscoveredEndpoint(
+              e.endpointId,
+              rssi: e.rssi,
+            );
+            _identifyingEndpoints.add(e.endpointId);
+          });
+        }
+        if (isNewUnidentifiedEndpoint) {
+          _log(
+            'EndpointFound awaiting LPC automatic identification: no usable discovery name',
+          );
+        }
+        return;
+      }
+      if (mounted)
+        setState(
+          () => _nearby[e.endpointId] = DiscoveredEndpoint(
+            e.endpointId,
+            rssi: e.rssi,
+            localName: name,
+          ),
+        );
+      if (_shouldLogEndpoint(e.endpointId)) {
+        _log('EndpointFound $name (unverified name)');
+      }
+    }
+  }
+
+  void _runtimeEvent(RuntimeEvent e) {
+    switch (e) {
+      case KnownPeerProbeStarted(:final discoveryEndpointId):
+        _log('KnownPeerProbeStarted $discoveryEndpointId');
+      case KnownPeerProbeFailed(:final discoveryEndpointId, :final error):
+        _identifyingEndpoints.remove(discoveryEndpointId);
+        _log('KnownPeerProbeFailed $discoveryEndpointId: ${error.code.name}');
+        if (mounted) setState(() {});
+      case UnknownPeerIdentified(:final connection, :final discoveryEndpointId):
+        _log('UnknownPeerIdentified ${connection.peerId}');
+        if (discoveryEndpointId != null &&
+            _unnamedNearby.containsKey(discoveryEndpointId)) {
+          _endpointPeers[discoveryEndpointId] = connection;
+          _attach(connection, 'UnknownPeerIdentified');
+          unawaited(
+            _identifyPeer(
+              connection,
+              discoveryEndpointId,
+              releaseRetention: false,
+            ),
+          );
+        }
+      case KnownPeerConnected(:final connection, :final discoveryEndpointId):
+        if (discoveryEndpointId != null) {
+          _endpointPeers[discoveryEndpointId] = connection;
+          _identifyingEndpoints.remove(discoveryEndpointId);
+          unawaited(
+            _identifyPeer(
+              connection,
+              discoveryEndpointId,
+              releaseRetention: false,
+            ),
+          );
+        }
+        _attach(connection, 'KnownPeerConnected');
+    }
+  }
+
+  void _attach(PeerConnection peer, String source) {
+    final id = peer.peerId.toString();
+    if (_connections[id] == peer) return;
+    _connections[id] = peer;
+    final name = _decodeMetadata(peer.remoteApplicationMetadata);
+    final f = _friends[id];
+    if (f != null) {
+      f.name = name ?? f.name;
+      f.presence = _Presence.online;
+      unawaited(_save());
+    }
+    _log(
+      '$source $id; security=${peer.securityLevel.name}; human name=${name ?? 'unusable'}',
+    );
+    _peerSubs.add(
+      peer.events.listen((e) {
+        if (e is PeerReconnecting)
+          _presence(id, _Presence.reconnecting, 'PeerReconnecting');
+        if (e is PeerReconnected)
+          _presence(
+            id,
+            _Presence.online,
+            'PeerReconnected ${e.transport.name}',
+          );
+        if (e is PeerDisconnected) {
+          _connections.remove(id);
+          _presence(id, _Presence.offline, 'PeerDisconnected');
+        }
+      }),
+    );
+    _peerSubs.add(peer.messages.listen((m) => _receive(peer, m)));
+    if (mounted) setState(() {});
+  }
+
+  void _presence(String id, _Presence p, String what) {
+    if (_friends[id] != null) _friends[id]!.presence = p;
+    _log('$what $id');
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _connect(
+    DiscoveredEndpoint endpoint, {
+    bool identifyOnly = false,
+  }) async {
+    try {
+      if (!identifyOnly && mounted) {
+        setState(
+          () => _connectUiStates[endpoint.id] = _ConnectUiState.connecting,
+        );
+      }
+      if (!identifyOnly) {
+        final identifiedPeer = _endpointPeers[endpoint.id];
+        if (identifiedPeer?.state == PeerConnectionState.ready) {
+          await _request(identifiedPeer!, endpointId: endpoint.id);
+          return;
+        }
+      }
+      if (identifyOnly && _identifyingEndpoints.contains(endpoint.id)) return;
+      if (identifyOnly) _identifyingEndpoints.add(endpoint.id);
+      final a = _runtime!.connect(endpoint.id);
+      a.events.listen((e) {
+        if (e is ConnectionAttemptConnected) {
+          _endpointPeers[endpoint.id] = e.connection;
+          _attach(e.connection, 'PeerConnected');
+          if (_identifyingEndpoints.remove(endpoint.id)) {
+            unawaited(_identifyPeer(e.connection, endpoint.id));
+          } else {
+            if (mounted) {
+              setState(
+                () => _status =
+                    'Connected to ${endpoint.localName}; sending friend request…',
+              );
+            }
+            unawaited(_request(e.connection, endpointId: endpoint.id));
+          }
+        } else if (e is ConnectionAttemptFailed) {
+          _identifyingEndpoints.remove(endpoint.id);
+          _connectUiStates.remove(endpoint.id);
+          _log('Connection failed ${e.error}');
+          if (mounted)
+            setState(() => _status = 'Connection failed: ${e.error.code.name}');
         }
       });
-      setState(() => _status = 'Connecting…');
-    } catch (error) {
-      setState(() => _status = 'Connection failed: $error');
+      setState(
+        () => _status = identifyOnly
+            ? 'Identifying nearby device…'
+            : 'Connecting to ${endpoint.localName}…',
+      );
+    } catch (e) {
+      _connectUiStates.remove(endpoint.id);
+      _log('Connect failed $e');
+      if (mounted) setState(() => _status = 'Connect failed: $e');
     }
   }
 
-  Future<void> _verifyPeer(
-    ConnectionAttempt attempt,
-    PeerId peerId,
-    String sas,
+  Future<void> _identifyPeer(
+    PeerConnection peer,
+    String endpointId, {
+    bool releaseRetention = true,
+  }) async {
+    final name = _decodeMetadata(peer.remoteApplicationMetadata);
+    if (name == null) {
+      _log('Identification completed but authenticated metadata was unusable');
+      if (mounted) {
+        setState(() => _status = 'Could not identify this nearby device');
+      }
+      return;
+    }
+    final discovered = _unnamedNearby.remove(endpointId);
+    _identifiedEndpointNames[endpointId] = name;
+    if (mounted) {
+      setState(
+        () => _nearby[endpointId] = DiscoveredEndpoint(
+          endpointId,
+          rssi: discovered?.rssi ?? 0,
+          localName: name,
+        ),
+      );
+    }
+    _log(
+      'Identification completed: authenticated display name "$name" (unverified)',
+    );
+    // Discovery-only identification MUST NOT request friendship or retain an
+    // application-owned direct connection.
+    if (releaseRetention) await _runtime?.releasePeerRetention(peer.peerId);
+  }
+
+  Future<void> _request(PeerConnection peer, {String? endpointId}) async {
+    final id = peer.peerId.toString();
+    if (_friends.containsKey(id) || peer.state != PeerConnectionState.ready)
+      return;
+    final request = _randomBytes(16);
+    final requestKey = '$id:${_hex(request)}';
+    _pending.putIfAbsent(id, () => {}).add(_hex(request));
+    _friendRequestTimers[requestKey] = Timer(const Duration(seconds: 30), () {
+      if (!(_pending[id]?.remove(_hex(request)) ?? false)) return;
+      _friendRequestTimers.remove(requestKey);
+      if (endpointId != null) _connectUiStates.remove(endpointId);
+      _log('FRIEND_REQUEST timed out for $id');
+      if (mounted) {
+        setState(() => _status = 'Friend request timed out');
+      }
+    });
+    if (endpointId != null && mounted) {
+      setState(() => _connectUiStates[endpointId] = _ConnectUiState.waiting);
+    }
+    final result = await _send(peer, _friendRequest, request, 'FRIEND_REQUEST');
+    if (result == null ||
+        result == SendState.failed ||
+        result == SendState.cancelled) {
+      _friendRequestTimers.remove(requestKey)?.cancel();
+      _pending[id]?.remove(_hex(request));
+      if (endpointId != null) _connectUiStates.remove(endpointId);
+      if (mounted) setState(() => _status = 'Friend request could not be sent');
+      return;
+    }
+    if (mounted) {
+      setState(() => _status = 'Friend request sent — waiting for acceptance');
+    }
+  }
+
+  Future<void> _receive(
+    PeerConnection peer,
+    PeerMessageReceived message,
   ) async {
+    final e = _Envelope.decode(message.bytes);
+    if (e == null) return _log('Ignored malformed application envelope');
+    switch (e.type) {
+      case _friendRequest:
+        await _friendRequestIn(peer, e.payload);
+      case _friendAccept:
+        await _friendResponse(peer, e.payload, true);
+      case _friendReject:
+        await _friendResponse(peer, e.payload, false);
+      case _friendRemove:
+        await _friendRemoveIn(peer, e.payload);
+      case _invite:
+        await _inviteIn(peer, e.payload);
+      case _chat:
+        await _directIn(peer, e.payload);
+      default:
+        _log('Ignored unknown application message type ${e.type}');
+    }
+  }
+
+  Future<void> _friendRequestIn(PeerConnection peer, Uint8List request) async {
+    final id = peer.peerId.toString();
+    if (request.length != 16 || !_handled.add('$id:${_hex(request)}')) return;
+    if (_friends.containsKey(id)) {
+      await _send(peer, _friendAccept, request, 'FRIEND_ACCEPT idempotent');
+      return;
+    }
+    final name = _decodeMetadata(peer.remoteApplicationMetadata);
+    if (name == null) {
+      await _send(
+        peer,
+        _friendReject,
+        request,
+        'FRIEND_REJECT metadata unavailable',
+      );
+      return;
+    }
     if (!mounted) return;
-    setState(() => _status = 'Verify peer $peerId');
-    final accepted = await showDialog<bool>(
+    _inboundFriendRequests.add(id);
+    final yes = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        title: const Text('Verify peer'),
+      builder: (c) => AlertDialog(
+        title: const Text('Friend request'),
         content: Text(
-          'Compare this code with the other device before connecting:\n\n'
-          '$sas',
-          textAlign: TextAlign.center,
-          style: Theme.of(context).textTheme.headlineMedium,
+          '$name wants to connect\n\nHuman-readable name: unverified (TOFU).',
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('Reject'),
+            onPressed: () => Navigator.pop(c, false),
+            child: const Text('Decline'),
           ),
           FilledButton(
-            onPressed: () => Navigator.of(context).pop(true),
+            onPressed: () => Navigator.pop(c, true),
             child: const Text('Accept'),
           ),
         ],
       ),
     );
     try {
-      await attempt.confirmPeerVerification(accepted == true);
-    } catch (error) {
-      if (mounted) setState(() => _status = 'Verification failed: $error');
+      if (yes == true) {
+        _friends[id] = _Friend(id, name, _Presence.online);
+        _newFriends.add(id);
+        await _save();
+        await _send(peer, _friendAccept, request, 'FRIEND_ACCEPT');
+        if (mounted) setState(() {});
+      } else {
+        await _send(peer, _friendReject, request, 'FRIEND_REJECT');
+      }
+    } finally {
+      _inboundFriendRequests.remove(id);
     }
   }
 
-  void _attach(PeerConnection connection) {
-    _connections[connection.peerId.toString()] = connection;
-    connection.messages.listen((message) {
-      if (mounted) {
+  Future<void> _friendResponse(
+    PeerConnection peer,
+    Uint8List request,
+    bool yes,
+  ) async {
+    final id = peer.peerId.toString();
+    final requestKey = '$id:${_hex(request)}';
+    if (request.length != 16 || !(_pending[id]?.remove(_hex(request)) ?? false))
+      return _log('Ignored unmatched FRIEND response');
+    _friendRequestTimers.remove(requestKey)?.cancel();
+    if (yes) {
+      final name = _decodeMetadata(peer.remoteApplicationMetadata);
+      if (name == null)
+        return _log('Acceptance ignored: unusable authenticated metadata');
+      _friends[id] = _Friend(id, name, _Presence.online);
+      _newFriends.add(id);
+      await _save();
+    }
+    for (final entry in _endpointPeers.entries) {
+      if (entry.value.peerId.toString() == id) {
+        _connectUiStates.remove(entry.key);
+      }
+    }
+    if (mounted)
+      setState(
+        () => _status = yes ? 'Friend added' : 'Friend request declined',
+      );
+  }
+
+  Future<void> _friendRemoveIn(PeerConnection peer, Uint8List payload) async {
+    final id = peer.peerId.toString();
+    if (payload.isNotEmpty || !_friends.containsKey(id)) {
+      _log('Ignored unauthorized or malformed FRIEND_REMOVE from $id');
+      return;
+    }
+    await _removeFriendRecord(id, reason: 'REMOTE_FRIEND_REMOVED');
+    if (mounted) setState(() => _status = 'Friend removed by the other device');
+  }
+
+  Future<void> _directIn(PeerConnection peer, Uint8List bytes) async {
+    final chat = _Chat.decode(bytes), id = peer.peerId.toString();
+    if (chat == null ||
+        chat.group ||
+        !_friends.containsKey(id) ||
+        !_same(chat.id, await _directId(_runtime!.localPeerId, peer.peerId)))
+      return _log('Ignored unauthorized/invalid direct chat from $id');
+    if (mounted) {
+      setState(() {
+        _lines.add(_Line(false, id, chat.text, false));
+        if (_tab != 1 || !_expandedChats.contains(id)) {
+          _unreadByFriend[id] = (_unreadByFriend[id] ?? 0) + 1;
+        }
+      });
+    }
+  }
+
+  Future<void> _sendDirect(String id) async {
+    final text = _direct.text.trim(), peer = _connections[id];
+    if (text.isEmpty) return;
+    if (peer == null || peer.state != PeerConnectionState.ready) {
+      setState(() => _status = 'Friend is offline');
+      return;
+    }
+    await _send(
+      peer,
+      _chat,
+      _Chat(
+        false,
+        await _directId(_runtime!.localPeerId, peer.peerId),
+        text,
+      ).encode(),
+      'Direct chat',
+    );
+    _direct.clear();
+    if (mounted) setState(() => _lines.add(_Line(true, id, text, false)));
+  }
+
+  Future<void> _inviteIn(PeerConnection peer, Uint8List p) async {
+    if (!_friends.containsKey(peer.peerId.toString()) ||
+        peer.state != PeerConnectionState.ready ||
+        p.length != 33 ||
+        p[32] < 2 ||
+        p[32] > 8)
+      return _log('Ignored unauthorized/invalid Group Demo invite');
+    if (_group != null)
+      return _log('Ignored invite: Group Demo already active');
+    if (!mounted) return;
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Group Demo invitation'),
+        content: const Text(
+          'Join this local demo group? It is not a private or secure messaging room; the join token is not proof of identity.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(c, false),
+            child: const Text('Decline'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(c, true),
+            child: const Text('Join'),
+          ),
+        ],
+      ),
+    );
+    if (yes == true)
+      _createGroup(
+        Uint8List.fromList(p.sublist(0, 16)),
+        Uint8List.fromList(p.sublist(16, 32)),
+        p[32],
+      );
+  }
+
+  Future<void> _createSelected() async {
+    final peers = _selected
+        .where((id) => _connections[id]?.state == PeerConnectionState.ready)
+        .toList();
+    if (peers.isEmpty) {
+      setState(() => _status = 'Select at least one online friend');
+      return;
+    }
+    final gid = _randomBytes(16), token = _randomBytes(16);
+    await _createGroup(gid, token, peers.length + 1);
+    for (final id in peers) {
+      await _send(
+        _connections[id]!,
+        _invite,
+        Uint8List.fromList([...gid, ...token, peers.length + 1]),
+        'GROUP_DEMO_INVITE',
+      );
+    }
+  }
+
+  Future<void> _createGroup(Uint8List id, Uint8List token, int maxPeers) async {
+    if (_group != null || _runtime == null) return;
+    _groupDemoId = id;
+    _group = _runtime!.joinOrCreateGroup(
+      GroupConfig(
+        applicationNamespace: utf8.encode('lpc-demo-group-v1'),
+        discoveryMode: DiscoveryMode.tokenScoped,
+        groupJoinToken: token,
+        maxPeers: maxPeers,
+        autoAccept: true,
+        autoMerge: true,
+        groupTrustMode: GroupTrustMode.openTofu,
+        coordinatorCheckpointing: false,
+      ),
+    );
+    _groupSub = _group!.events.listen(_groupEvent);
+    _log('Group Demo active: OPEN_TOFU is not a private room');
+    if (mounted) setState(() {});
+  }
+
+  void _groupEvent(GroupEvent e) {
+    if (e is GroupReady)
+      _log('GroupReady coordinator=${e.coordinatorPeerId}');
+    else if (e is MemberJoined)
+      _log('MemberJoined ${e.member.peerId}');
+    else if (e is MemberLeft)
+      _log('MemberLeft ${e.peerId}');
+    else if (e is CoordinatorChanged)
+      _log('CoordinatorChanged ${e.current}; local=${e.localIsCoordinator}');
+    else if (e is GroupError)
+      _log('GroupError ${e.errorCode.name}');
+    else if (e is ReliableMessageReceived) {
+      final c = _Chat.decode(e.bytes);
+      if (c != null &&
+          c.group &&
+          _groupDemoId != null &&
+          _same(c.id, _groupDemoId!))
         setState(
-          () => _messages.add(
-            _ChatLine(false, utf8.decode(message.bytes, allowMalformed: true)),
+          () =>
+              _lines.add(_Line(false, e.sourcePeerId.toString(), c.text, true)),
+        );
+    }
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _sendGroup() async {
+    final text = _groupText.text.trim(), g = _group;
+    if (text.isEmpty ||
+        g == null ||
+        g.state != GroupState.ready ||
+        _groupDemoId == null)
+      return;
+    try {
+      final b = g.broadcast(
+        _Envelope(_chat, _Chat(true, _groupDemoId!, text).encode()).encode(),
+        options: const SendOptions(deliveryMode: DeliveryMode.reliableAcked),
+      );
+      _log('Group broadcast submitted to ${b.targetPeerIds.length} targets');
+      await b.completed;
+      _log(
+        'Broadcast ${b.state.name}: ${b.results.values.map((h) => h.state.name).join(', ')}',
+      );
+      _groupText.clear();
+      if (mounted)
+        setState(
+          () => _lines.add(
+            _Line(true, _runtime!.localPeerId.toString(), text, true),
           ),
         );
-      }
-    });
-    if (mounted) setState(() => _status = 'Connected to ${connection.peerId}');
+    } catch (e) {
+      _log('Group send failed $e');
+    }
   }
 
-  Future<void> _send() async {
-    final value = _text.text.trim();
-    if (value.isEmpty || _connections.isEmpty) return;
+  Future<SendState?> _send(
+    PeerConnection peer,
+    int type,
+    List<int> bytes,
+    String label,
+  ) async {
     try {
-      await _connections.values.first.send(utf8.encode(value)).completed;
-      _text.clear();
-      if (mounted) setState(() => _messages.add(_ChatLine(true, value)));
-    } catch (error) {
-      if (mounted) setState(() => _status = 'Send failed: $error');
+      final s = await peer
+          .send(
+            _Envelope(type, Uint8List.fromList(bytes)).encode(),
+            options: const SendOptions(
+              deliveryMode: DeliveryMode.reliableAcked,
+            ),
+          )
+          .completed;
+      _log('$label ${s.name}');
+      return s;
+    } catch (e) {
+      _log('$label failed $e');
+      if (mounted) setState(() => _status = '$label failed');
+      return null;
     }
+  }
+
+  Future<void> _remove(String id) async {
+    final friend = _friends[id];
+    if (friend == null || !mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Remove friend?'),
+        content: Text('Remove ${friend.name} from your friends?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    final connection = _connections[id];
+    if (connection?.state == PeerConnectionState.ready) {
+      await _send(connection!, _friendRemove, const [], 'FRIEND_REMOVE');
+    } else {
+      _log('Friend removal is local only: peer is offline');
+    }
+    await _removeFriendRecord(id, reason: 'FRIEND_REMOVED');
+  }
+
+  Future<void> _removeFriendRecord(String id, {required String reason}) async {
+    final peer = PeerId(_unhex(id));
+    _friends.remove(id);
+    _unreadByFriend.remove(id);
+    _newFriends.remove(id);
+    _expandedChats.remove(id);
+    await _save();
+    await _runtime?.releasePeerRetention(peer);
+    await _host?.disconnect(peer, reason: reason);
+    _log('Friend removed; known-peer retention released ($reason)');
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _changeName() async {
+    final c = TextEditingController(text: _name);
+    final value = await showDialog<String>(
+      context: context,
+      builder: (x) => AlertDialog(
+        title: const Text('Profile name'),
+        content: TextField(controller: c),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(x),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(x, c.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    final name = _validName(value);
+    if (name == null) {
+      if (value != null)
+        setState(() => _status = 'Name must be 1–29 UTF-8 bytes');
+      return;
+    }
+    await _runtime?.updateLocalPresentation(
+      LocalPresentation(
+        discoveryDisplayName: name,
+        applicationMetadata: _metadata(name),
+      ),
+    );
+    _name = name;
+    (await SharedPreferences.getInstance()).setString(
+      'local_display_name',
+      name,
+    );
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _save() async =>
+      (await SharedPreferences.getInstance()).setStringList(
+        'friend_records',
+        _friends.values.map((f) => jsonEncode(f.toJson())).toList(),
+      );
+  Uint8List _randomBytes(int n) =>
+      Uint8List.fromList(List.generate(n, (_) => _random.nextInt(256)));
+  String _alias() {
+    const a = ['Silver', 'Quiet', 'Blue', 'Golden'],
+        b = ['Otter', 'Maple', 'Falcon', 'Willow'];
+    return '${a[_random.nextInt(a.length)]} ${b[_random.nextInt(b.length)]} ${1000 + _random.nextInt(9000)}';
   }
 
   @override
   void dispose() {
-    _text.dispose();
+    _endpointExpiryTimer?.cancel();
+    for (final timer in _friendRequestTimers.values) {
+      timer.cancel();
+    }
+    _direct.dispose();
+    _groupText.dispose();
+    for (final s in _peerSubs) {
+      unawaited(s.cancel());
+    }
+    unawaited(_groupSub?.cancel());
+    unawaited(_backendSub?.cancel());
+    unawaited(_runtimeSub?.cancel());
+    _group?.leave();
+    unawaited(_discovery?.stop());
+    unawaited(_host?.close());
     unawaited(_runtime?.close());
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) {
-    final endpoints =
-        _discovery?.currentEndpoints() ?? const <DiscoveredEndpoint>[];
-    return Scaffold(
-      appBar: AppBar(title: const Text('Local Peer Messages')),
-      body: Column(
-        children: [
-          ListTile(
-            title: Text(_status),
-            subtitle: Text('${_connections.length} connected peer(s)'),
+  Widget build(BuildContext c) => Scaffold(
+    appBar: AppBar(
+      title: const Text('LPC Demo Messenger'),
+      actions: [
+        TextButton.icon(
+          onPressed: _changeName,
+          icon: const Icon(Icons.person_outline),
+          label: Text(_name, overflow: TextOverflow.ellipsis),
+        ),
+      ],
+    ),
+    body: IndexedStack(
+      index: _tab,
+      children: [_nearbyView(), _chatsView(), _groupView(), _diagnosticsView()],
+    ),
+    bottomNavigationBar: NavigationBar(
+      selectedIndex: _tab,
+      onDestinationSelected: (v) => setState(() {
+        _tab = v;
+        if (v == 1) {
+          // This small demo treats opening Chats as viewing its current-run
+          // updates; it deliberately has no network read-receipt protocol.
+          _unreadByFriend.clear();
+          _newFriends.clear();
+        }
+      }),
+      destinations: [
+        const NavigationDestination(icon: Icon(Icons.radar), label: 'Nearby'),
+        NavigationDestination(icon: _chatNavigationIcon, label: 'Chats'),
+        const NavigationDestination(
+          icon: Icon(Icons.groups_outlined),
+          label: 'Group Demo',
+        ),
+        const NavigationDestination(
+          icon: Icon(Icons.monitor_heart_outlined),
+          label: 'Diagnostics',
+        ),
+      ],
+    ),
+  );
+  Widget _nearbyView() => ListView(
+    children: [
+      ListTile(
+        title: Text(_status),
+        subtitle: const Text(
+          'LPC security: ENCRYPTED_TOFU • names are unverified human-readable claims',
+        ),
+      ),
+      for (final e in _nearby.values)
+        Builder(
+          builder: (context) {
+            final peer = _endpointPeers[e.id];
+            final isFriend =
+                peer != null && _friends.containsKey(peer.peerId.toString());
+            final connectState = _connectUiStates[e.id];
+            return ListTile(
+              title: Text(e.localName!),
+              subtitle: Text(
+                isFriend ? 'Encrypted TOFU' : 'Human-readable name: unverified',
+              ),
+              trailing: isFriend
+                  ? const Chip(label: Text('Friend'))
+                  : FilledButton(
+                      onPressed: connectState == null
+                          ? () => _connect(e)
+                          : null,
+                      child: Text(switch (connectState) {
+                        _ConnectUiState.connecting => 'Connecting…',
+                        _ConnectUiState.waiting => 'Waiting…',
+                        null => 'Connect',
+                      }),
+                    ),
+            );
+          },
+        ),
+      if (_unnamedNearby.isNotEmpty)
+        const Padding(
+          padding: EdgeInsets.fromLTRB(16, 16, 16, 4),
+          child: Text('Devices without an advertised name'),
+        ),
+      for (final e in _unnamedNearby.values)
+        ListTile(
+          leading: const Icon(Icons.help_outline),
+          title: Text(
+            _identifyingEndpoints.contains(e.id)
+                ? 'Identifying nearby device…'
+                : 'Nearby device could not be identified',
           ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: Row(
+          subtitle: Text(
+            _identifyingEndpoints.contains(e.id)
+                ? 'Temporarily connecting to obtain authenticated metadata.'
+                : 'No usable authenticated display name was received.',
+          ),
+          trailing: _identifyingEndpoints.contains(e.id)
+              ? const SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : OutlinedButton(
+                  onPressed: () => _connect(e, identifyOnly: true),
+                  child: const Text('Retry'),
+                ),
+        ),
+    ],
+  );
+
+  Widget get _chatNavigationIcon {
+    final unreadMessages = _unreadByFriend.values.fold<int>(
+      0,
+      (sum, value) => sum + value,
+    );
+    final count = unreadMessages + _newFriends.length;
+    return Badge(
+      isLabelVisible: count > 0,
+      label: Text(count > 99 ? '99+' : '$count'),
+      child: const Icon(Icons.chat_bubble_outline),
+    );
+  }
+
+  Widget _chatsView() => ListView(
+    children: [
+      for (final f in _friends.values)
+        Card(
+          child: ExpansionTile(
+            onExpansionChanged: (expanded) {
+              setState(() {
+                if (expanded) {
+                  _expandedChats.add(f.peerId);
+                  _unreadByFriend.remove(f.peerId);
+                  _newFriends.remove(f.peerId);
+                } else {
+                  _expandedChats.remove(f.peerId);
+                }
+              });
+            },
+            title: Row(
               children: [
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: _discover,
-                    icon: const Icon(Icons.search),
-                    label: const Text('Discover'),
+                Expanded(child: Text(f.name)),
+                if (_newFriends.contains(f.peerId))
+                  const Padding(
+                    padding: EdgeInsets.only(left: 8),
+                    child: Chip(label: Text('New friend')),
                   ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: FilledButton.icon(
-                    onPressed: _advertise,
-                    icon: const Icon(Icons.wifi_tethering),
-                    label: const Text('Advertise'),
+                if ((_unreadByFriend[f.peerId] ?? 0) > 0)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8),
+                    child: Badge(
+                      label: Text('${_unreadByFriend[f.peerId]}'),
+                      child: const Icon(Icons.mark_chat_unread_outlined),
+                    ),
                   ),
-                ),
               ],
             ),
-          ),
-          if (endpoints.isNotEmpty)
-            SizedBox(
-              height: 90,
-              child: ListView(
-                children: [
-                  for (final endpoint in endpoints)
-                    ListTile(
-                      dense: true,
-                      title: Text(endpoint.localName ?? endpoint.id),
-                      subtitle: Text('RSSI ${endpoint.rssi}'),
-                      trailing: TextButton(
-                        onPressed: () => _connect(endpoint),
-                        child: const Text('Connect'),
+            subtitle: Text(f.presence.name.toUpperCase()),
+            trailing: IconButton(
+              icon: const Icon(Icons.person_remove_outlined),
+              onPressed: () => _remove(f.peerId),
+            ),
+            children: [
+              for (final l in _lines.where(
+                (l) => !l.group && l.peer == f.peerId,
+              ))
+                ListTile(
+                  title: Text(l.text),
+                  trailing: l.local ? const Icon(Icons.arrow_upward) : null,
+                ),
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _direct,
+                        enabled: f.presence == _Presence.online,
+                        decoration: const InputDecoration(hintText: 'Message'),
                       ),
                     ),
-                ],
-              ),
-            ),
-          const Divider(height: 1),
-          Expanded(
-            child: _messages.isEmpty
-                ? const Center(
-                    child: Text('Discover and connect to another device.'),
-                  )
-                : ListView.builder(
-                    itemCount: _messages.length,
-                    itemBuilder: (_, index) {
-                      final message = _messages[index];
-                      return Align(
-                        alignment: message.local
-                            ? Alignment.centerRight
-                            : Alignment.centerLeft,
-                        child: Card(
-                          child: Padding(
-                            padding: const EdgeInsets.all(10),
-                            child: Text(message.text),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-          ),
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _text,
-                    onSubmitted: (_) => _send(),
-                    decoration: const InputDecoration(hintText: 'Message'),
-                  ),
+                    IconButton(
+                      onPressed: f.presence == _Presence.online
+                          ? () => _sendDirect(f.peerId)
+                          : null,
+                      icon: const Icon(Icons.send),
+                    ),
+                  ],
                 ),
-                IconButton(onPressed: _send, icon: const Icon(Icons.send)),
-              ],
+              ),
+            ],
+          ),
+        ),
+    ],
+  );
+  Widget _groupView() {
+    final g = _group;
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        const Text(
+          'A local demo group—not a private or secure messaging room. OPEN_TOFU and the join token do not prove identity.',
+        ),
+        const SizedBox(height: 12),
+        if (g == null) ...[
+          for (final f in _friends.values)
+            CheckboxListTile(
+              value: _selected.contains(f.peerId),
+              onChanged: f.presence == _Presence.online
+                  ? (v) => setState(
+                      () => v!
+                          ? _selected.add(f.peerId)
+                          : _selected.remove(f.peerId),
+                    )
+                  : null,
+              title: Text(f.name),
+              subtitle: Text(f.presence.name.toUpperCase()),
             ),
+          FilledButton(
+            onPressed: _createSelected,
+            child: const Text('Create Group Demo'),
+          ),
+        ] else ...[
+          ListTile(
+            title: Text('State: ${g.state.name}'),
+            subtitle: Text(
+              'Coordinator: ${g.coordinatorPeerId}\nLocal is coordinator: ${g.isCoordinator}\nTerm: ${g.coordinatorTerm}',
+            ),
+          ),
+          for (final l in _lines.where((l) => l.group))
+            ListTile(
+              title: Text(l.text),
+              subtitle: Text(l.local ? 'You' : l.peer),
+            ),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _groupText,
+                  decoration: const InputDecoration(hintText: 'Group message'),
+                ),
+              ),
+              IconButton(
+                onPressed: g.state == GroupState.ready ? _sendGroup : null,
+                icon: const Icon(Icons.send),
+              ),
+            ],
+          ),
+          TextButton(
+            onPressed: () {
+              g.leave();
+              setState(() => _group = null);
+            },
+            child: const Text('Leave Group Demo'),
           ),
         ],
-      ),
+      ],
     );
+  }
+
+  Widget _diagnosticsView() => ListView(
+    children: [
+      ListTile(
+        title: Text('Local PeerId: ${_runtime?.localPeerId ?? 'starting'}'),
+        subtitle: const Text(
+          'Raw PeerIds and transport details are diagnostics, never user identity.',
+        ),
+      ),
+      for (final l in _logs) ListTile(dense: true, title: Text(l)),
+    ],
+  );
+}
+
+class _Resolver implements KnownPeerResolver {
+  _Resolver(this.friends);
+  final Map<String, _Friend> friends;
+  @override
+  Future<bool> isKnownPeer(PeerId id) async =>
+      friends.containsKey(id.toString());
+}
+
+enum _Presence { offline, online, reconnecting }
+
+enum _ConnectUiState { connecting, waiting }
+
+class _Friend {
+  _Friend(this.peerId, this.name, this.presence);
+  final String peerId;
+  String name;
+  _Presence presence;
+  Map<String, dynamic> toJson() => {
+    'peerId': peerId,
+    'authenticatedName': name,
+  };
+  factory _Friend.fromJson(Map<String, dynamic> j) => _Friend(
+    j['peerId'] as String,
+    j['authenticatedName'] as String? ?? 'Unverified name',
+    _Presence.offline,
+  );
+}
+
+class _Line {
+  const _Line(this.local, this.peer, this.text, this.group);
+  final bool local, group;
+  final String peer, text;
+}
+
+class _Envelope {
+  _Envelope(this.type, this.payload);
+  final int type;
+  final Uint8List payload;
+  Uint8List encode() => Uint8List.fromList([
+    1,
+    type,
+    payload.length >> 8,
+    payload.length & 255,
+    ...payload,
+  ]);
+  static _Envelope? decode(List<int> b) {
+    if (b.length < 4 || b[0] != 1 || ((b[2] << 8) | b[3]) != b.length - 4)
+      return null;
+    return _Envelope(b[1], Uint8List.fromList(b.sublist(4)));
   }
 }
 
-class _ChatLine {
-  const _ChatLine(this.local, this.text);
-  final bool local;
+class _Chat {
+  _Chat(this.group, this.id, this.text);
+  final bool group;
+  final Uint8List id;
   final String text;
+  Uint8List encode() {
+    final b = utf8.encode(text);
+    return Uint8List.fromList([
+      group ? 2 : 1,
+      ...id,
+      b.length >> 8,
+      b.length & 255,
+      ...b,
+    ]);
+  }
+
+  static _Chat? decode(List<int> b) {
+    if (b.length < 20 || (b[0] != 1 && b[0] != 2)) return null;
+    final n = (b[17] << 8) | b[18];
+    if (n < 1 || n > 4096 || b.length != 19 + n) return null;
+    try {
+      return _Chat(
+        b[0] == 2,
+        Uint8List.fromList(b.sublist(1, 17)),
+        utf8.decode(b.sublist(19)),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
 }
+
+List<int> _metadata(String n) {
+  final b = utf8.encode(n);
+  if (b.isEmpty || b.length > 29) throw ArgumentError('name');
+  return [1, b.length, ...b];
+}
+
+String? _decodeMetadata(List<int> b) {
+  if (b.length < 3 ||
+      b[0] != 1 ||
+      b[1] < 1 ||
+      b[1] > 29 ||
+      b.length != b[1] + 2)
+    return null;
+  try {
+    return _validName(utf8.decode(b.sublist(2)));
+  } catch (_) {
+    return null;
+  }
+}
+
+String? _validName(String? n) =>
+    n == null ||
+        n.trim().isEmpty ||
+        utf8.encode(n).length > 29 ||
+        n.runes.any((r) => r < 0x20 || r == 0x7f)
+    ? null
+    : n;
+Future<Uint8List> _directId(PeerId l, PeerId r) async {
+  final a = l.bytes,
+      b = r.bytes,
+      o = _compare(a, b) <= 0 ? [...a, ...b] : [...b, ...a];
+  final h = await Sha256().hash([...ascii.encode('LPC-DEMO-DIRECT-1'), ...o]);
+  return Uint8List.fromList(h.bytes.take(16).toList());
+}
+
+int _compare(List<int> a, List<int> b) {
+  for (var i = 0; i < a.length; i++) {
+    final x = a[i].compareTo(b[i]);
+    if (x != 0) return x;
+  }
+  return 0;
+}
+
+bool _same(List<int> a, List<int> b) =>
+    a.length == b.length &&
+    List.generate(a.length, (i) => a[i] == b[i]).every((x) => x);
+String _hex(List<int> b) =>
+    b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+List<int> _unhex(String s) => List.generate(
+  s.length ~/ 2,
+  (i) => int.parse(s.substring(i * 2, i * 2 + 2), radix: 16),
+);
