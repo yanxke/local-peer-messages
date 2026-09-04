@@ -643,6 +643,8 @@ On acceptance, if no other Group Demo is active, it creates a GroupSession using
 
 If another Group Demo is already active, the receiver MUST decline or require the current demo group to be left first.
 
+Each device initially creates a local singleton GroupSession. LPC MUST then use authenticated `GROUP_INFO` and `GROUP_MERGE` exchange to converge compatible sessions onto one winning LPC `GroupId`, one committed membership snapshot, and one coordinator before accepting group traffic. A locally READY singleton with a different coordinator or LPC `GroupId` is not a formed Group Demo and MUST NOT be treated as a usable group route. The application supplies only the common namespace, token, and capacity; it MUST NOT select the winning group, coordinator, or membership itself.
+
 ---
 
 # 19. Group Demo Security Meaning
@@ -915,21 +917,22 @@ The suite MUST verify with 2..8 devices where practical:
 2. Invited peers use the same application namespace and join token.
 3. No user selects Host or Coordinator.
 4. LPC automatically produces a GroupReady state.
-5. LPC elects one coordinator.
-6. Non-coordinator-to-non-coordinator group delivery works through coordinator relay when topology requires it.
-7. The receiver reports original `sourcePeerId`, not coordinator PeerId.
-8. `broadcast(..., RELIABLE_ACKED)` exposes correct per-target completion/failure semantics.
-9. Removing/killing the coordinator causes LPC coordinator migration without user approval.
-10. Messaging can continue after migration once LPC returns the group to an appropriate READY state.
-11. Group Demo state is not automatically restored after app restart.
-12. The UI does not describe OPEN_TOFU or the join token as private-room authentication.
-13. Creating Group Demo while the persistent HostSession and DiscoverySession are active does not stop/recreate them and does not require duplicate physical advertising/listening/scanning.
-14. If two invited friends already have a compatible READY TOFU direct PeerConnection, GroupSession can reuse/adopt that connection for its logical ownership without leaving a duplicate physical BLE connection.
-15. Direct chat and Group Demo traffic sharing one PeerConnection are delivered to the correct logical application path.
-16. Leaving Group Demo does not disconnect a direct friendship PeerConnection still required for direct/known-peer use.
-17. Removing friendship while GroupSession still owns the shared connection does not break GroupSession.
-18. `GROUP_DEMO_INVITE` is presented only when authenticated `sourcePeerId` is currently a FriendRecord and the invite arrived through a usable READY direct PeerConnection.
-19. After friend removal, a former friend that reconnects through HostSession cannot cause a Group Demo invitation UI or GroupSession creation by sending `GROUP_DEMO_INVITE`.
+5. All invited devices converge to the same LPC `GroupId`, committed member set, coordinator PeerId, and coordinator term after authenticated automatic merge; different local singleton coordinator IDs are not acceptable completion.
+6. LPC elects one coordinator.
+7. Non-coordinator-to-non-coordinator group delivery works through coordinator relay when topology requires it.
+8. The receiver reports original `sourcePeerId`, not coordinator PeerId.
+9. `broadcast(..., RELIABLE_ACKED)` exposes correct per-target completion/failure semantics.
+10. Removing/killing the coordinator causes LPC coordinator migration without user approval.
+11. Messaging can continue after migration once LPC returns the group to an appropriate READY state.
+12. Group Demo state is not automatically restored after app restart.
+13. The UI does not describe OPEN_TOFU or the join token as private-room authentication.
+14. Creating Group Demo while the persistent HostSession and DiscoverySession are active does not stop/recreate them and does not require duplicate physical advertising/listening/scanning.
+15. If two invited friends already have a compatible READY TOFU direct PeerConnection, GroupSession can reuse/adopt that connection for its logical ownership without leaving a duplicate physical BLE connection.
+16. Direct chat and Group Demo traffic sharing one PeerConnection are delivered to the correct logical application path.
+17. Leaving Group Demo does not disconnect a direct friendship PeerConnection still required for direct/known-peer use.
+18. Removing friendship while GroupSession still owns the shared connection does not break GroupSession.
+19. `GROUP_DEMO_INVITE` is presented only when authenticated `sourcePeerId` is currently a FriendRecord and the invite arrived through a usable READY direct PeerConnection.
+20. After friend removal, a former friend that reconnects through HostSession cannot cause a Group Demo invitation UI or GroupSession creation by sending `GROUP_DEMO_INVITE`.
 
 ---
 

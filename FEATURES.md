@@ -7,7 +7,7 @@
 - Exact `DemoMessengerMetadataV1`, application envelope, friendship control, and chat payload validation.
 - TOFU runtime configuration, symmetric advertising/discovery, indexed persisted `FriendRecord` resolver, and LPC automatic known-peer reconnection.
 - Explicit friendship acceptance, idempotent in-process requests, friend presence, removal/retention release, and `RELIABLE_ACKED` direct chat admission.
-- One ephemeral OPEN_TOFU Group Demo, direct invites, reliable broadcast, original group source attribution, coordinator diagnostics, and no durable outbox.
+- One ephemeral OPEN_TOFU Group Demo, direct invites, authenticated LPC automatic singleton-session merge to a shared group/coordinator, reliable broadcast, original group source attribution, coordinator diagnostics, and no durable outbox.
 - Diagnostics for discovery, relationship, reconnect, group membership/coordinator, and send outcomes.
 - Android/iOS interoperability fallback for unnamed BLE advertisements: LPC's bounded automatic known-peer probe exposes authenticated metadata before releasing an unknown peer, allowing the app to display the unverified friendly name. It never displays/persists the platform address or sends a friendship request as a side effect.
 - Nearby endpoint rows and their ephemeral endpoint-name caches expire after eight seconds without a new discovery observation. Idle inbound non-friend HostSession ownership is released after eight seconds unless a friendship request is in progress.
