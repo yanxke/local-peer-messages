@@ -83,7 +83,11 @@ class _MessagingPageState extends State<MessagingPage> {
   void _expireEndpoints() {
     final cutoff = DateTime.now().subtract(const Duration(seconds: 8));
     final expired = _endpointSeenAt.entries
-        .where((entry) => entry.value.isBefore(cutoff))
+        .where(
+          (entry) =>
+              entry.value.isBefore(cutoff) &&
+              _endpointPeers[entry.key]?.state != PeerConnectionState.ready,
+        )
         .map((entry) => entry.key)
         .toList(growable: false);
     if (expired.isEmpty) return;
@@ -130,15 +134,35 @@ class _MessagingPageState extends State<MessagingPage> {
         final f = _Friend.fromJson(jsonDecode(raw) as Map<String, dynamic>);
         _friends[f.peerId] = f;
       }
-      final backend = PlatformBleBackend();
+      final identityStore = PlatformIdentityStore();
+      final localIdentity = await LocalIdentity.load(identityStore);
+      _log(
+        'Startup identity=${localIdentity.peerId} persistedFriends=${_friends.length} name="$_name"',
+      );
+      final backend = PlatformBleBackend(logger: _log);
       _runtime = await NearbyRuntime.create(
         platformBleBackend: backend,
+        identityStore: identityStore,
         config: RuntimeConfig(
           discoveryDisplayName: _name,
           applicationMetadata: _metadata(_name),
           trustMode: HandshakeTrustMode.tofu,
           autoReconnect: true,
-          autoConnectKnownPeers: true,
+          logger: _log,
+          // Android GATT service discovery plus the first fragmented HELLO
+          // can exceed the default 15-second probe window on a warm/restarted
+          // Bluetooth stack. Keep the operation bounded, but allow the
+          // authenticated handshake to finish before declaring the endpoint
+          // lost.
+          reconnectTimeoutMs: 30000,
+          // Both peers advertise and scan, but only one side should launch
+          // the startup known-peer probe.  The peer with the lexicographically
+          // smaller persisted PeerId is the deterministic initiator; the
+          // other side remains a listener.  This avoids two Android privacy
+          // GATT links contending before LPC can authenticate/rank them.
+          autoConnectKnownPeers: _shouldInitiateKnownPeerProbes(
+            localIdentity.peerId,
+          ),
           knownPeerResolver: _Resolver(_friends),
           maxConcurrentKnownPeerProbes: 4,
           maxPendingKnownPeerProbes: 64,
@@ -149,9 +173,21 @@ class _MessagingPageState extends State<MessagingPage> {
           enableLan: true,
         ),
       );
-      _runtimeSub = _runtime!.events.listen(_runtimeEvent);
-      _backendSub = backend.events.listen(_platformEvent);
-      if (!await _permission()) return;
+      _runtimeSub = _runtime!.events.listen(
+        _runtimeEvent,
+        onError: (Object error, StackTrace stack) {
+          _log('Runtime event stream error: $error');
+        },
+      );
+      _backendSub = backend.events.listen(
+        _platformEvent,
+        onError: (Object error, StackTrace stack) {
+          _log('Platform BLE event stream error: $error');
+        },
+      );
+      final permissionGranted = await _permission();
+      _log('Bluetooth permission result=$permissionGranted');
+      if (!permissionGranted) return;
       _host = _runtime!.createHostSession(
         HostConfig(
           maxPeers: 7,
@@ -159,12 +195,25 @@ class _MessagingPageState extends State<MessagingPage> {
           trustMode: HandshakeTrustMode.tofu,
         ),
       );
-      _host!.events.listen((e) {
-        if (e is HostPeerConnected) {
-          _onHostPeerConnected(e.connection, e.discoveryEndpointId);
-        }
-      });
+      _host!.events.listen(
+        (e) {
+          if (e is HostPeerConnected) {
+            _log(
+              'HostPeerConnected peer=${e.connection.peerId} endpoint=${e.discoveryEndpointId ?? 'none'}',
+            );
+            _onHostPeerConnected(e.connection, e.discoveryEndpointId);
+          } else if (e is HostPeerVerificationRequired) {
+            _log('HostPeerVerificationRequired peer=${e.peerId}');
+          } else if (e is HostSessionClosed) {
+            _log('HostSessionClosed');
+          }
+        },
+        onError: (Object error, StackTrace stack) {
+          _log('Host event stream error: $error');
+        },
+      );
       await _host!.startAdvertising();
+      _log('Host advertising started');
       _discovery = await _runtime!.startDiscovery();
       _log('Runtime started: symmetric advertising/listening and discovery');
       if (mounted) setState(() => _status = 'Nearby discovery active');
@@ -174,8 +223,14 @@ class _MessagingPageState extends State<MessagingPage> {
     }
   }
 
+  bool _shouldInitiateKnownPeerProbes(PeerId localPeerId) {
+    if (_friends.length != 1) return true;
+    final remote = _friends.keys.single;
+    return localPeerId.toString().compareTo(remote) < 0;
+  }
+
   void _onHostPeerConnected(PeerConnection peer, String? endpointId) {
-    if (endpointId != null) _endpointPeers[endpointId] = peer;
+    if (endpointId != null) _rememberConnectedEndpoint(peer, endpointId);
     _attach(peer, 'PeerConnected');
     // An inbound connection used solely by the remote device's automatic
     // discovery identification must not keep the persistent HostSession
@@ -209,6 +264,11 @@ class _MessagingPageState extends State<MessagingPage> {
 
   void _platformEvent(PlatformBleEvent e) {
     if (e is PlatformEndpointFound) {
+      if (_shouldLogEndpoint(e.endpointId)) {
+        _log(
+          'BLE endpoint observed endpoint=${e.endpointId} rssi=${e.rssi} name=${e.localName ?? 'none'}',
+        );
+      }
       _endpointSeenAt[e.endpointId] = DateTime.now();
       final name = _validName(e.localName);
       if (name == null) {
@@ -262,6 +322,22 @@ class _MessagingPageState extends State<MessagingPage> {
     }
   }
 
+  void _rememberConnectedEndpoint(PeerConnection peer, String endpointId) {
+    _endpointPeers[endpointId] = peer;
+    _endpointSeenAt[endpointId] = DateTime.now();
+    final name = _decodeMetadata(peer.remoteApplicationMetadata);
+    if (name == null) return;
+    final previous = _nearby[endpointId];
+    _unnamedNearby.remove(endpointId);
+    _identifyingEndpoints.remove(endpointId);
+    _identifiedEndpointNames[endpointId] = name;
+    _nearby[endpointId] = DiscoveredEndpoint(
+      endpointId,
+      rssi: previous?.rssi ?? -127,
+      localName: name,
+    );
+  }
+
   void _runtimeEvent(RuntimeEvent e) {
     switch (e) {
       case KnownPeerProbeStarted(:final discoveryEndpointId):
@@ -271,10 +347,11 @@ class _MessagingPageState extends State<MessagingPage> {
         _log('KnownPeerProbeFailed $discoveryEndpointId: ${error.code.name}');
         if (mounted) setState(() {});
       case UnknownPeerIdentified(:final connection, :final discoveryEndpointId):
-        _log('UnknownPeerIdentified ${connection.peerId}');
-        if (discoveryEndpointId != null &&
-            _unnamedNearby.containsKey(discoveryEndpointId)) {
-          _endpointPeers[discoveryEndpointId] = connection;
+        _log(
+          'UnknownPeerIdentified peer=${connection.peerId} endpoint=${discoveryEndpointId ?? 'none'} state=${connection.state.name}',
+        );
+        if (discoveryEndpointId != null) {
+          _rememberConnectedEndpoint(connection, discoveryEndpointId);
           _attach(connection, 'UnknownPeerIdentified');
           unawaited(
             _identifyPeer(
@@ -285,8 +362,11 @@ class _MessagingPageState extends State<MessagingPage> {
           );
         }
       case KnownPeerConnected(:final connection, :final discoveryEndpointId):
+        _log(
+          'KnownPeerConnected event peer=${connection.peerId} endpoint=${discoveryEndpointId ?? 'none'} state=${connection.state.name}',
+        );
         if (discoveryEndpointId != null) {
-          _endpointPeers[discoveryEndpointId] = connection;
+          _rememberConnectedEndpoint(connection, discoveryEndpointId);
           _identifyingEndpoints.remove(discoveryEndpointId);
           unawaited(
             _identifyPeer(
@@ -302,7 +382,10 @@ class _MessagingPageState extends State<MessagingPage> {
 
   void _attach(PeerConnection peer, String source) {
     final id = peer.peerId.toString();
-    if (_connections[id] == peer) return;
+    if (_connections[id] == peer) {
+      _log('Ignoring duplicate attach peer=$id source=$source');
+      return;
+    }
     _connections[id] = peer;
     final name = _decodeMetadata(peer.remoteApplicationMetadata);
     final f = _friends[id];
@@ -316,6 +399,18 @@ class _MessagingPageState extends State<MessagingPage> {
     );
     _peerSubs.add(
       peer.events.listen((e) {
+        // A known-peer probe can establish a replacement logical connection
+        // while the previous one is still inside LPC's bounded RESUME window.
+        // Events from that superseded connection must not overwrite the
+        // replacement's presence or remove it from the map when its expiry
+        // eventually produces PeerDisconnected.
+        if (_connections[id] != peer) {
+          _log('Ignoring stale peer event peer=$id event=${e.runtimeType}');
+          return;
+        }
+        _log(
+          'Peer event peer=$id event=${e.runtimeType} state=${peer.state.name}',
+        );
         if (e is PeerReconnecting)
           _presence(id, _Presence.reconnecting, 'PeerReconnecting');
         if (e is PeerReconnected)
@@ -326,11 +421,33 @@ class _MessagingPageState extends State<MessagingPage> {
           );
         if (e is PeerDisconnected) {
           _connections.remove(id);
+          final endpointIds = _endpointPeers.entries
+              .where((entry) => entry.value == peer)
+              .map((entry) => entry.key)
+              .toList(growable: false);
+          for (final endpointId in endpointIds) {
+            _endpointPeers.remove(endpointId);
+            _endpointSeenAt.remove(endpointId);
+            _nearby.remove(endpointId);
+            _unnamedNearby.remove(endpointId);
+            _identifiedEndpointNames.remove(endpointId);
+            _identifyingEndpoints.remove(endpointId);
+          }
           _presence(id, _Presence.offline, 'PeerDisconnected');
         }
       }),
     );
-    _peerSubs.add(peer.messages.listen((m) => _receive(peer, m)));
+    _peerSubs.add(
+      peer.messages.listen(
+        (m) {
+          _log('Peer message received peer=$id bytes=${m.bytes.length}');
+          unawaited(_receive(peer, m));
+        },
+        onError: (Object error, StackTrace stack) {
+          _log('Peer message stream error peer=$id error=$error');
+        },
+      ),
+    );
     if (mounted) setState(() {});
   }
 
@@ -345,6 +462,14 @@ class _MessagingPageState extends State<MessagingPage> {
     bool identifyOnly = false,
   }) async {
     try {
+      _log(
+        'Connect requested endpoint=${endpoint.id} name=${endpoint.localName} identifyOnly=$identifyOnly',
+      );
+      // A user Connect adopts an LPC automatic identification probe when one
+      // is already running for this endpoint. Keep the attempt, but change
+      // its application purpose from name-only identification to the normal
+      // friendship flow so READY is followed by FRIEND_REQUEST.
+      if (!identifyOnly) _identifyingEndpoints.remove(endpoint.id);
       if (!identifyOnly && mounted) {
         setState(
           () => _connectUiStates[endpoint.id] = _ConnectUiState.connecting,
@@ -353,6 +478,9 @@ class _MessagingPageState extends State<MessagingPage> {
       if (!identifyOnly) {
         final identifiedPeer = _endpointPeers[endpoint.id];
         if (identifiedPeer?.state == PeerConnectionState.ready) {
+          _log(
+            'Connect reusing READY endpoint=${endpoint.id} peer=${identifiedPeer!.peerId}',
+          );
           await _request(identifiedPeer!, endpointId: endpoint.id);
           return;
         }
@@ -360,29 +488,44 @@ class _MessagingPageState extends State<MessagingPage> {
       if (identifyOnly && _identifyingEndpoints.contains(endpoint.id)) return;
       if (identifyOnly) _identifyingEndpoints.add(endpoint.id);
       final a = _runtime!.connect(endpoint.id);
-      a.events.listen((e) {
-        if (e is ConnectionAttemptConnected) {
-          _endpointPeers[endpoint.id] = e.connection;
-          _attach(e.connection, 'PeerConnected');
-          if (_identifyingEndpoints.remove(endpoint.id)) {
-            unawaited(_identifyPeer(e.connection, endpoint.id));
-          } else {
-            if (mounted) {
-              setState(
-                () => _status =
-                    'Connected to ${endpoint.localName}; sending friend request…',
-              );
+      a.events.listen(
+        (e) {
+          if (e is ConnectionAttemptConnected) {
+            _log(
+              'ConnectionAttemptConnected endpoint=${endpoint.id} peer=${e.connection.peerId}',
+            );
+            _endpointPeers[endpoint.id] = e.connection;
+            _attach(e.connection, 'PeerConnected');
+            if (_identifyingEndpoints.remove(endpoint.id)) {
+              unawaited(_identifyPeer(e.connection, endpoint.id));
+            } else {
+              if (mounted) {
+                setState(
+                  () => _status =
+                      'Connected to ${endpoint.localName}; sending friend request…',
+                );
+              }
+              unawaited(_request(e.connection, endpointId: endpoint.id));
             }
-            unawaited(_request(e.connection, endpointId: endpoint.id));
+          } else if (e is ConnectionAttemptFailed) {
+            _log(
+              'ConnectionAttemptFailed endpoint=${endpoint.id} code=${e.error.code.name} detail=${e.error.message}',
+            );
+            _identifyingEndpoints.remove(endpoint.id);
+            _connectUiStates.remove(endpoint.id);
+            _log('Connection failed ${e.error}');
+            if (mounted)
+              setState(
+                () => _status = 'Connection failed: ${e.error.code.name}',
+              );
           }
-        } else if (e is ConnectionAttemptFailed) {
-          _identifyingEndpoints.remove(endpoint.id);
-          _connectUiStates.remove(endpoint.id);
-          _log('Connection failed ${e.error}');
-          if (mounted)
-            setState(() => _status = 'Connection failed: ${e.error.code.name}');
-        }
-      });
+        },
+        onError: (Object error, StackTrace stack) {
+          _log(
+            'Connection attempt stream error endpoint=${endpoint.id}: $error',
+          );
+        },
+      );
       setState(
         () => _status = identifyOnly
             ? 'Identifying nearby device…'
@@ -466,7 +609,15 @@ class _MessagingPageState extends State<MessagingPage> {
     PeerMessageReceived message,
   ) async {
     final e = _Envelope.decode(message.bytes);
-    if (e == null) return _log('Ignored malformed application envelope');
+    if (e == null) {
+      _log(
+        'Ignored malformed application envelope peer=${peer.peerId} bytes=${message.bytes.length}',
+      );
+      return;
+    }
+    _log(
+      'Application message peer=${peer.peerId} type=0x${e.type.toRadixString(16)} bytes=${e.payload.length}',
+    );
     switch (e.type) {
       case _friendRequest:
         await _friendRequestIn(peer, e.payload);
@@ -602,7 +753,7 @@ class _MessagingPageState extends State<MessagingPage> {
       setState(() => _status = 'Friend is offline');
       return;
     }
-    await _send(
+    final result = await _send(
       peer,
       _chat,
       _Chat(
@@ -612,6 +763,10 @@ class _MessagingPageState extends State<MessagingPage> {
       ).encode(),
       'Direct chat',
     );
+    if (result != SendState.remoteAcknowledged &&
+        result != SendState.sentToTransport) {
+      return;
+    }
     _direct.clear();
     if (mounted) setState(() => _lines.add(_Line(true, id, text, false)));
   }
@@ -705,7 +860,10 @@ class _MessagingPageState extends State<MessagingPage> {
     else if (e is GroupError)
       _log('GroupError ${e.errorCode.name}');
     else if (e is ReliableMessageReceived) {
-      final c = _Chat.decode(e.bytes);
+      final envelope = _Envelope.decode(e.bytes);
+      final c = envelope?.type == _chat
+          ? _Chat.decode(envelope!.payload)
+          : null;
       if (c != null &&
           c.group &&
           _groupDemoId != null &&
@@ -963,37 +1121,34 @@ class _MessagingPageState extends State<MessagingPage> {
             );
           },
         ),
-      if (_unnamedNearby.isNotEmpty)
+      if (_onlineFriendsWithoutNearbyEndpoint.isNotEmpty)
         const Padding(
           padding: EdgeInsets.fromLTRB(16, 16, 16, 4),
-          child: Text('Devices without an advertised name'),
+          child: Text('Online friends'),
         ),
-      for (final e in _unnamedNearby.values)
+      for (final f in _onlineFriendsWithoutNearbyEndpoint)
         ListTile(
-          leading: const Icon(Icons.help_outline),
-          title: Text(
-            _identifyingEndpoints.contains(e.id)
-                ? 'Identifying nearby device…'
-                : 'Nearby device could not be identified',
-          ),
-          subtitle: Text(
-            _identifyingEndpoints.contains(e.id)
-                ? 'Temporarily connecting to obtain authenticated metadata.'
-                : 'No usable authenticated display name was received.',
-          ),
-          trailing: _identifyingEndpoints.contains(e.id)
-              ? const SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : OutlinedButton(
-                  onPressed: () => _connect(e, identifyOnly: true),
-                  child: const Text('Retry'),
-                ),
+          title: Text(f.name),
+          subtitle: const Text('Encrypted TOFU • ONLINE'),
+          trailing: const Chip(label: Text('Friend')),
         ),
     ],
   );
+
+  List<_Friend> get _onlineFriendsWithoutNearbyEndpoint {
+    final represented = <String>{};
+    for (final endpoint in _nearby.values) {
+      final peer = _endpointPeers[endpoint.id];
+      if (peer != null) represented.add(peer.peerId.toString());
+    }
+    return _friends.values
+        .where(
+          (friend) =>
+              friend.presence == _Presence.online &&
+              !represented.contains(friend.peerId),
+        )
+        .toList(growable: false);
+  }
 
   Widget get _chatNavigationIcon {
     final unreadMessages = _unreadByFriend.values.fold<int>(
