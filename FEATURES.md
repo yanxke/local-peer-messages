@@ -10,7 +10,7 @@
 - Direct and group chat receive paths unwrap and validate the application envelope before presenting messages; failed direct sends are not shown as delivered.
 - One ephemeral OPEN_TOFU Group Demo, direct invites, authenticated LPC automatic singleton-session merge to a shared group/coordinator, reliable broadcast, original group source attribution, coordinator diagnostics, and no durable outbox.
 - Diagnostics for discovery, relationship, reconnect, group membership/coordinator, and send outcomes.
-- Android/iOS interoperability fallback for unnamed BLE advertisements: LPC's bounded automatic known-peer probe exposes authenticated metadata before releasing an unknown peer, allowing the app to display the unverified friendly name. Unauthenticated endpoints remain internal and are never shown as generic nearby devices; platform addresses are never displayed or persisted, and identification never sends a friendship request as a side effect.
+- Android/iOS interoperability fallback for unnamed BLE advertisements: LPC's bounded automatic known-peer probe exposes authenticated metadata before releasing an unknown peer, allowing the app to display the unverified friendly name. Unauthenticated endpoints remain internal and are never shown as generic nearby devices; platform addresses are never used as identity or persisted, while local diagnostics may log them for current-run correlation, and identification never sends a friendship request as a side effect.
 - Nearby endpoint rows and their ephemeral endpoint-name caches expire after eight seconds without a new discovery observation. Idle inbound non-friend HostSession ownership is released after eight seconds unless a friendship request is in progress.
 - Timestamped, rate-limited endpoint diagnostics plus local unread-message and new-friend badges in the Chats navigation and collapsed conversation rows. Friendship acceptance is shown separately from TOFU human-name verification.
 - LPC reconnect candidates preserve the original READY connection trust mode, preventing TOFU peers from rejecting RESUME with a mismatched HELLO trust mode.
@@ -25,8 +25,8 @@
 - Reconnecting inbound GATT peers have the same bounded reconnect deadline, so a powered-off remote device cannot remain online indefinitely while still allowing resume before the deadline.
 - Superseded reconnect/probe connections cannot overwrite a replacement friend's presence; duplicate Android GATT readiness callbacks are coalesced before they can create competing sessions.
 - Android peripheral GATT notifications are serialized through native send acknowledgements, with bounded backpressure and server-link cancellation on transport close, preventing restart handshakes from receiving non-contiguous fragments.
-- Runtime stops competing automatic privacy-endpoint probes once an authenticated peer is READY; the LPC logical reconnect scheduler remains active for genuine transport loss.
-- Messenger startup known-peer probing uses the persisted PeerId order to select one initiator for a single-friend pair, avoiding simultaneous Android privacy-address GATT startup links.
+- LPC coalesces duplicate observations per ephemeral endpoint and ranks authenticated duplicate logical connections without suppressing automatic probes for unrelated known friends.
+- Messenger leaves known-peer probing and reconnect ownership to LPC on both symmetric advertising/scanning peers; the app does not arbitrate transport direction.
 - Messenger uses a bounded 30-second GATT probe/reconnect window to accommodate observed Android restart latency without making identification or reconnect indefinite.
 - Structured diagnostics cover startup/configuration, discovery, probe scheduling, native GATT lifecycle, handshake stages, reconnect attempts, peer ownership, application message delivery, and transport failures; payload and key material contents are summarized or omitted.
 

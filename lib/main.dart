@@ -14,6 +14,7 @@ const _friendRequest = 1,
     _friendRemove = 4,
     _invite = 0x10,
     _chat = 0x20;
+
 void main() => runApp(const LocalPeerMessagesApp());
 
 class LocalPeerMessagesApp extends StatelessWidget {
@@ -83,11 +84,7 @@ class _MessagingPageState extends State<MessagingPage> {
   void _expireEndpoints() {
     final cutoff = DateTime.now().subtract(const Duration(seconds: 8));
     final expired = _endpointSeenAt.entries
-        .where(
-          (entry) =>
-              entry.value.isBefore(cutoff) &&
-              _endpointPeers[entry.key]?.state != PeerConnectionState.ready,
-        )
+        .where((entry) => entry.value.isBefore(cutoff))
         .map((entry) => entry.key)
         .toList(growable: false);
     if (expired.isEmpty) return;
@@ -155,14 +152,10 @@ class _MessagingPageState extends State<MessagingPage> {
           // authenticated handshake to finish before declaring the endpoint
           // lost.
           reconnectTimeoutMs: 30000,
-          // Both peers advertise and scan, but only one side should launch
-          // the startup known-peer probe.  The peer with the lexicographically
-          // smaller persisted PeerId is the deterministic initiator; the
-          // other side remains a listener.  This avoids two Android privacy
-          // GATT links contending before LPC can authenticate/rank them.
-          autoConnectKnownPeers: _shouldInitiateKnownPeerProbes(
-            localIdentity.peerId,
-          ),
+          // LPC owns automatic known-peer probing and reconnect. The app does
+          // not arbitrate which side probes; this is required for symmetric
+          // presence and for the coexistence integration test.
+          autoConnectKnownPeers: true,
           knownPeerResolver: _Resolver(_friends),
           maxConcurrentKnownPeerProbes: 4,
           maxPendingKnownPeerProbes: 64,
@@ -221,12 +214,6 @@ class _MessagingPageState extends State<MessagingPage> {
       _log('Startup failed: $e');
       if (mounted) setState(() => _status = 'Startup failed: $e');
     }
-  }
-
-  bool _shouldInitiateKnownPeerProbes(PeerId localPeerId) {
-    if (_friends.length != 1) return true;
-    final remote = _friends.keys.single;
-    return localPeerId.toString().compareTo(remote) < 0;
   }
 
   void _onHostPeerConnected(PeerConnection peer, String? endpointId) {
@@ -477,11 +464,12 @@ class _MessagingPageState extends State<MessagingPage> {
       }
       if (!identifyOnly) {
         final identifiedPeer = _endpointPeers[endpoint.id];
-        if (identifiedPeer?.state == PeerConnectionState.ready) {
+        if (identifiedPeer != null &&
+            identifiedPeer.state == PeerConnectionState.ready) {
           _log(
-            'Connect reusing READY endpoint=${endpoint.id} peer=${identifiedPeer!.peerId}',
+            'Connect reusing READY endpoint=${endpoint.id} peer=${identifiedPeer.peerId}',
           );
-          await _request(identifiedPeer!, endpointId: endpoint.id);
+          await _request(identifiedPeer, endpointId: endpoint.id);
           return;
         }
       }

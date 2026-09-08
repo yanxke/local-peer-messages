@@ -316,7 +316,7 @@ opaque random string
 
 as the visible name.
 
-If no usable human-readable discovery name is available, the endpoint MUST NOT be displayed as a platform address, opaque identifier, or generic person/device identity. LPC SHALL own the bounded automatic known-peer probe connection used for discovery-only identification and SHALL coalesce duplicate observations of its currently known `DiscoveryEndpointId` rather than repeatedly reconnecting for each scan callback. LPC MUST expose the authenticated probe connection/metadata to the application before it releases a negative known-peer probe result. The application MAY cache the resulting display name by the ephemeral `DiscoveryEndpointId` for the current discovery lifetime only; it MUST NOT persist that mapping or treat it as peer identity. If authenticated `DemoMessengerMetadataV1` is valid, the demo MAY then display that unverified human-readable name in the normal selectable unknown-peer list. This automatic identification connection MUST NOT itself send `FRIEND_REQUEST`, create a `FriendRecord`, or create a durable connection/probe queue.
+If no usable human-readable discovery name is available, the endpoint MUST NOT be displayed in the user-facing Nearby list as a platform address, opaque identifier, or generic person/device identity. LPC SHALL own the bounded automatic known-peer probe connection used for discovery-only identification and SHALL coalesce duplicate observations of its currently known `DiscoveryEndpointId` rather than repeatedly reconnecting for each scan callback. LPC MUST expose the authenticated probe connection/metadata to the application before it releases a negative known-peer probe result. The application MAY cache the resulting display name by the ephemeral `DiscoveryEndpointId` for the current discovery lifetime only; it MUST NOT persist that mapping or treat it as peer identity. If authenticated `DemoMessengerMetadataV1` is valid, the demo MAY then display that unverified human-readable name in the normal selectable unknown-peer list. This automatic identification connection MUST NOT itself send `FRIEND_REQUEST`, create a `FriendRecord`, or create a durable connection/probe queue.
 
 After LPC emits authenticated metadata for an unknown peer, a valid `DemoMessengerMetadataV1.displayName` SHOULD replace a truncated discovery hint.
 
@@ -853,7 +853,7 @@ transport upgrade/fallback events
 queue/backpressure errors
 ```
 
-Raw Bluetooth MAC addresses or platform GUIDs SHOULD NOT be promoted as user identity.
+Raw Bluetooth MAC addresses or platform GUIDs MUST NOT be promoted as user identity or persisted as relationship identity. Because these values are non-secret transport diagnostics, the Diagnostics view and diagnostic logs MAY show raw Bluetooth MAC addresses, platform GUIDs, `DiscoveryEndpointId` values, and other platform transport identifiers to correlate events during the current run. This allowance applies only to diagnostics and logs; it does not permit such values in Nearby identity presentation, FriendRecords, or other persistent application state. Diagnostic logs MUST continue to omit private keys, PSKs, authentication secrets, and raw application payload contents; payloads SHOULD be represented by type, length, and state summaries.
 
 Raw `PeerId`, `SessionId`, `GroupId`, and transport details MAY be shown in Diagnostics.
 
