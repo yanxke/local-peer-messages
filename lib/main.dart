@@ -68,7 +68,7 @@ class _MessagingPageState extends State<MessagingPage> {
   StreamSubscription<GroupEvent>? _groupSub;
   Timer? _endpointExpiryTimer;
   final _peerSubs = <StreamSubscription<dynamic>>[];
-  String _name = '', _status = 'Starting…';
+  String _name = '';
   int _tab = 0;
 
   @override
@@ -108,6 +108,20 @@ class _MessagingPageState extends State<MessagingPage> {
     _logs.insert(0, '$timestamp  $message');
     if (_logs.length > 100) _logs.removeLast();
     debugPrint('[LPC Demo][$timestamp] $message');
+  }
+
+  // Direct actions need immediate feedback even though the Nearby page no
+  // longer carries a persistent status banner. Background discovery events
+  // stay in Diagnostics so automatic reconnects do not interrupt the user.
+  void _showUserFeedback(String message) {
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    if (messenger == null) return;
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(
+        SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
+      );
   }
 
   bool _shouldLogEndpoint(String endpointId) {
@@ -209,10 +223,8 @@ class _MessagingPageState extends State<MessagingPage> {
       _log('Host advertising started');
       _discovery = await _runtime!.startDiscovery();
       _log('Runtime started: symmetric advertising/listening and discovery');
-      if (mounted) setState(() => _status = 'Nearby discovery active');
     } catch (e) {
       _log('Startup failed: $e');
-      if (mounted) setState(() => _status = 'Startup failed: $e');
     }
   }
 
@@ -487,12 +499,6 @@ class _MessagingPageState extends State<MessagingPage> {
             if (_identifyingEndpoints.remove(endpoint.id)) {
               unawaited(_identifyPeer(e.connection, endpoint.id));
             } else {
-              if (mounted) {
-                setState(
-                  () => _status =
-                      'Connected to ${endpoint.localName}; sending friend request…',
-                );
-              }
               unawaited(_request(e.connection, endpointId: endpoint.id));
             }
           } else if (e is ConnectionAttemptFailed) {
@@ -502,10 +508,14 @@ class _MessagingPageState extends State<MessagingPage> {
             _identifyingEndpoints.remove(endpoint.id);
             _connectUiStates.remove(endpoint.id);
             _log('Connection failed ${e.error}');
-            if (mounted)
-              setState(
-                () => _status = 'Connection failed: ${e.error.code.name}',
-              );
+            if (mounted) {
+              setState(() {});
+              if (!identifyOnly) {
+                _showUserFeedback(
+                  'Could not connect to ${endpoint.localName}: ${e.error.code.name}',
+                );
+              }
+            }
           }
         },
         onError: (Object error, StackTrace stack) {
@@ -514,15 +524,15 @@ class _MessagingPageState extends State<MessagingPage> {
           );
         },
       );
-      setState(
-        () => _status = identifyOnly
-            ? 'Identifying nearby device…'
-            : 'Connecting to ${endpoint.localName}…',
-      );
     } catch (e) {
       _connectUiStates.remove(endpoint.id);
       _log('Connect failed $e');
-      if (mounted) setState(() => _status = 'Connect failed: $e');
+      if (mounted) {
+        setState(() {});
+        if (!identifyOnly) {
+          _showUserFeedback('Could not connect to ${endpoint.localName}');
+        }
+      }
     }
   }
 
@@ -534,9 +544,6 @@ class _MessagingPageState extends State<MessagingPage> {
     final name = _decodeMetadata(peer.remoteApplicationMetadata);
     if (name == null) {
       _log('Identification completed but authenticated metadata was unusable');
-      if (mounted) {
-        setState(() => _status = 'Could not identify this nearby device');
-      }
       return;
     }
     final discovered = _unnamedNearby.remove(endpointId);
@@ -571,7 +578,10 @@ class _MessagingPageState extends State<MessagingPage> {
       if (endpointId != null) _connectUiStates.remove(endpointId);
       _log('FRIEND_REQUEST timed out for $id');
       if (mounted) {
-        setState(() => _status = 'Friend request timed out');
+        setState(() {});
+        _showUserFeedback(
+          'No response from ${_decodeMetadata(peer.remoteApplicationMetadata) ?? 'the peer'}',
+        );
       }
     });
     if (endpointId != null && mounted) {
@@ -584,11 +594,12 @@ class _MessagingPageState extends State<MessagingPage> {
       _friendRequestTimers.remove(requestKey)?.cancel();
       _pending[id]?.remove(_hex(request));
       if (endpointId != null) _connectUiStates.remove(endpointId);
-      if (mounted) setState(() => _status = 'Friend request could not be sent');
+      _log('FRIEND_REQUEST could not be sent for $id');
+      if (mounted) {
+        setState(() {});
+        _showUserFeedback('Could not send the friend request');
+      }
       return;
-    }
-    if (mounted) {
-      setState(() => _status = 'Friend request sent — waiting for acceptance');
     }
   }
 
@@ -688,23 +699,36 @@ class _MessagingPageState extends State<MessagingPage> {
     if (request.length != 16 || !(_pending[id]?.remove(_hex(request)) ?? false))
       return _log('Ignored unmatched FRIEND response');
     _friendRequestTimers.remove(requestKey)?.cancel();
-    if (yes) {
-      final name = _decodeMetadata(peer.remoteApplicationMetadata);
-      if (name == null)
-        return _log('Acceptance ignored: unusable authenticated metadata');
-      _friends[id] = _Friend(id, name, _Presence.online);
-      _newFriends.add(id);
-      await _save();
-    }
+    final displayName = _decodeMetadata(peer.remoteApplicationMetadata);
     for (final entry in _endpointPeers.entries) {
       if (entry.value.peerId.toString() == id) {
         _connectUiStates.remove(entry.key);
       }
     }
-    if (mounted)
-      setState(
-        () => _status = yes ? 'Friend added' : 'Friend request declined',
+    if (yes) {
+      if (displayName == null) {
+        _log('Acceptance ignored: unusable authenticated metadata');
+        if (mounted) {
+          setState(() {});
+          _showUserFeedback(
+            'The connection was accepted, but the peer identity was invalid',
+          );
+        }
+        return;
+      }
+      final name = displayName;
+      _friends[id] = _Friend(id, name, _Presence.online);
+      _newFriends.add(id);
+      await _save();
+    }
+    if (mounted) {
+      setState(() {});
+      _showUserFeedback(
+        yes
+            ? 'Friend request accepted by ${displayName ?? 'the peer'}'
+            : 'Friend request declined by ${displayName ?? 'the peer'}',
       );
+    }
   }
 
   Future<void> _friendRemoveIn(PeerConnection peer, Uint8List payload) async {
@@ -714,7 +738,6 @@ class _MessagingPageState extends State<MessagingPage> {
       return;
     }
     await _removeFriendRecord(id, reason: 'REMOTE_FRIEND_REMOVED');
-    if (mounted) setState(() => _status = 'Friend removed by the other device');
   }
 
   Future<void> _directIn(PeerConnection peer, Uint8List bytes) async {
@@ -738,7 +761,8 @@ class _MessagingPageState extends State<MessagingPage> {
     final text = _direct.text.trim(), peer = _connections[id];
     if (text.isEmpty) return;
     if (peer == null || peer.state != PeerConnectionState.ready) {
-      setState(() => _status = 'Friend is offline');
+      _log('Direct message not sent: friend $id is offline');
+      _showUserFeedback('Message not sent: friend is offline');
       return;
     }
     final result = await _send(
@@ -753,6 +777,7 @@ class _MessagingPageState extends State<MessagingPage> {
     );
     if (result != SendState.remoteAcknowledged &&
         result != SendState.sentToTransport) {
+      _showUserFeedback('Message could not be delivered');
       return;
     }
     _direct.clear();
@@ -801,7 +826,7 @@ class _MessagingPageState extends State<MessagingPage> {
         .where((id) => _connections[id]?.state == PeerConnectionState.ready)
         .toList();
     if (peers.isEmpty) {
-      setState(() => _status = 'Select at least one online friend');
+      _log('Group creation skipped: no selected online friends');
       return;
     }
     final gid = _randomBytes(16), token = _randomBytes(16);
@@ -890,6 +915,7 @@ class _MessagingPageState extends State<MessagingPage> {
         );
     } catch (e) {
       _log('Group send failed $e');
+      if (mounted) _showUserFeedback('Group message could not be delivered');
     }
   }
 
@@ -912,7 +938,6 @@ class _MessagingPageState extends State<MessagingPage> {
       return s;
     } catch (e) {
       _log('$label failed $e');
-      if (mounted) setState(() => _status = '$label failed');
       return null;
     }
   }
@@ -981,8 +1006,10 @@ class _MessagingPageState extends State<MessagingPage> {
     );
     final name = _validName(value);
     if (name == null) {
-      if (value != null)
-        setState(() => _status = 'Name must be 1–29 UTF-8 bytes');
+      if (value != null) {
+        _log('Profile name rejected: invalid UTF-8 byte length');
+        _showUserFeedback('Name must be 1–29 UTF-8 bytes');
+      }
       return;
     }
     await _runtime?.updateLocalPresentation(
@@ -1076,12 +1103,6 @@ class _MessagingPageState extends State<MessagingPage> {
   );
   Widget _nearbyView() => ListView(
     children: [
-      ListTile(
-        title: Text(_status),
-        subtitle: const Text(
-          'LPC security: ENCRYPTED_TOFU • names are unverified human-readable claims',
-        ),
-      ),
       for (final e in _nearby.values)
         Builder(
           builder: (context) {
