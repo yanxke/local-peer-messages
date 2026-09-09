@@ -1,0 +1,9 @@
+devices:
+  peer_a:
+    platform: android
+    serial: 1f07ac7e
+    role: primary
+  peer_b:
+    platform: ios
+    serial: 00008030-00021D341483802E
+    role: secondary

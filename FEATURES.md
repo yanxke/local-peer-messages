@@ -29,6 +29,7 @@
 - Messenger leaves known-peer probing and reconnect ownership to LPC on both symmetric advertising/scanning peers; the app does not arbitrate transport direction.
 - Messenger uses a bounded 30-second GATT probe/reconnect window to accommodate observed Android restart latency without making identification or reconnect indefinite.
 - Structured diagnostics cover startup/configuration, discovery, probe scheduling, native GATT lifecycle, handshake stages, reconnect attempts, peer ownership, application message delivery, and transport failures; payload and key material contents are summarized or omitted.
+- Debug-only integration control API exposes snapshots, event polling, and authenticated application actions without changing release behavior. The Python real-device lab builds, installs, launches, locks, resets, and exercises Android+iOS participants while retaining run metadata, JUnit results, snapshots, events, and logs.
 
 ## Unimplemented / dependent on LPC binding exposure
 
@@ -36,3 +37,4 @@
 - Native `EndpointUpdated` / `EndpointLost` callbacks; the current platform event API exposes endpoint-found only.
 - Explicit send-handle state-change stream (final states are displayed).
 - Full physical-device integration scenarios from sections 28–32; the widget smoke test covers the required primary views, but multi-device BLE tests need device/emulator hardware support.
+- Additional reliability scenarios (duplicate links, process restart, Bluetooth interruption, and endpoint rotation) remain to be added to the host runner; the initial pairing and bidirectional-chat smoke scenario is implemented.

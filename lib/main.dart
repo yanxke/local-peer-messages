@@ -3,10 +3,13 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:local_peer_connections/local_peer_connections.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'integration_control.dart';
 
 const _friendRequest = 1,
     _friendAccept = 2,
@@ -50,6 +53,8 @@ class _MessagingPageState extends State<MessagingPage> {
       _handled = <String>{},
       _logs = <String>[];
   final _lines = <_Line>[];
+  final _receivedMessages = <Map<String, Object?>>[];
+  int _nextReceivedMessage = 1;
   final _identifyingEndpoints = <String>{};
   final _inboundFriendRequests = <String>{};
   final _friendRequestTimers = <String, Timer>{};
@@ -66,8 +71,10 @@ class _MessagingPageState extends State<MessagingPage> {
   StreamSubscription<PlatformBleEvent>? _backendSub;
   StreamSubscription<RuntimeEvent>? _runtimeSub;
   StreamSubscription<GroupEvent>? _groupSub;
+  IntegrationControlServer? _integrationControl;
   Timer? _endpointExpiryTimer;
   final _peerSubs = <StreamSubscription<dynamic>>[];
+  final _pendingFriendDecisions = <String, Completer<bool>>{};
   String _name = '';
   int _tab = 0;
 
@@ -78,7 +85,207 @@ class _MessagingPageState extends State<MessagingPage> {
       const Duration(seconds: 2),
       (_) => _expireEndpoints(),
     );
+    if (kDebugMode) unawaited(_startIntegrationControl());
     unawaited(_start());
+  }
+
+  Future<void> _startIntegrationControl() async {
+    final control = IntegrationControlServer(
+      snapshot: _integrationSnapshot,
+      command: _integrationCommand,
+      logger: _log,
+    );
+    _integrationControl = control;
+    try {
+      await control.start();
+      control.emit('runtime_state', {'state': 'control_ready'});
+    } catch (error) {
+      _log('Integration control server failed: $error');
+    }
+  }
+
+  Future<Map<String, Object?>> _integrationSnapshot() async => {
+    'localPeerId': _runtime?.localPeerId.toString(),
+    'displayName': _name,
+    'runtimeReady': _runtime != null,
+    'discoveryActive': _discovery != null,
+    'friends': [
+      for (final friend in _friends.values)
+        {
+          'peerId': friend.peerId,
+          'name': friend.name,
+          'presence': friend.presence.name,
+        },
+    ],
+    'peers': [
+      for (final entry in _connections.entries)
+        {
+          'peerId': entry.key,
+          'state': entry.value.state.name,
+          'security': entry.value.securityLevel.name,
+        },
+    ],
+    'nearbyEndpoints': [
+      for (final endpoint in _nearby.values)
+        {
+          'endpointId': endpoint.id,
+          'name': endpoint.localName,
+          'rssi': endpoint.rssi,
+        },
+    ],
+    'pendingFriendRequests': _inboundFriendRequests.toList(growable: false),
+    'pendingFriendResponses': _pending.keys.toList(growable: false),
+    'messagesReceived': List.unmodifiable(_receivedMessages),
+    'messageCount': _lines.length,
+    'logs': _logs.take(50).toList(growable: false),
+  };
+
+  Future<Map<String, Object?>> _integrationCommand(
+    String action,
+    Map<String, Object?> arguments,
+  ) async {
+    switch (action) {
+      case 'getSnapshot':
+        return await _integrationSnapshot();
+      case 'resetTestState':
+        await _resetIntegrationState();
+        return await _integrationSnapshot();
+      case 'setDisplayName':
+        await _setIntegrationDisplayName(_requiredArgument(arguments, 'name'));
+        return await _integrationSnapshot();
+      case 'startNearby':
+        final runtime = _runtime;
+        if (runtime == null) throw StateError('runtime is not ready');
+        _discovery ??= await runtime.startDiscovery();
+        _integrationControl?.emit('runtime_state', {
+          'state': 'discovery_active',
+        });
+        return await _integrationSnapshot();
+      case 'acceptFriend':
+        await _decideIntegrationFriendRequest(
+          _requiredArgument(arguments, 'peerId'),
+          true,
+        );
+        return await _integrationSnapshot();
+      case 'declineFriend':
+        await _decideIntegrationFriendRequest(
+          _requiredArgument(arguments, 'peerId'),
+          false,
+        );
+        return await _integrationSnapshot();
+      case 'connect':
+        final endpointId = _requiredArgument(arguments, 'endpointId');
+        final endpoint = _nearby[endpointId];
+        if (endpoint == null) {
+          throw StateError('nearby endpoint is not present: $endpointId');
+        }
+        unawaited(_connect(endpoint));
+        return {'endpointId': endpointId, 'state': 'connect_requested'};
+      case 'sendDirectMessage':
+        final peerId = _requiredArgument(arguments, 'peerId');
+        final text = _requiredArgument(arguments, 'text');
+        final result = await _sendDirect(peerId, text);
+        if (result != SendState.remoteAcknowledged &&
+            result != SendState.sentToTransport) {
+          throw StateError('direct message was not delivered');
+        }
+        return {'sendState': result?.name};
+      case 'disconnectPeer':
+        final id = _requiredArgument(arguments, 'peerId');
+        final peer = PeerId(_unhex(id));
+        await _host?.disconnect(peer, reason: 'INTEGRATION_TEST');
+        _integrationControl?.emit('transport_state', {
+          'peerId': id,
+          'state': 'disconnect_requested',
+        });
+        return await _integrationSnapshot();
+      default:
+        throw ArgumentError('unsupported integration action: $action');
+    }
+  }
+
+  String _requiredArgument(Map<String, Object?> arguments, String key) {
+    final value = arguments[key];
+    if (value is! String || value.isEmpty) {
+      throw ArgumentError('missing non-empty argument: $key');
+    }
+    return value;
+  }
+
+  Future<void> _decideIntegrationFriendRequest(String id, bool accepted) async {
+    final decision = _pendingFriendDecisions[id];
+    if (decision == null || decision.isCompleted) {
+      throw StateError('no pending friendship prompt for peer $id');
+    }
+    decision.complete(accepted);
+  }
+
+  Future<void> _setIntegrationDisplayName(String value) async {
+    final name = _validName(value);
+    if (name == null) throw ArgumentError('invalid display name');
+    final runtime = _runtime;
+    if (runtime == null) throw StateError('runtime is not ready');
+    await runtime.updateLocalPresentation(
+      LocalPresentation(
+        discoveryDisplayName: name,
+        applicationMetadata: _metadata(name),
+      ),
+    );
+    _name = name;
+    (await SharedPreferences.getInstance()).setString(
+      'local_display_name',
+      name,
+    );
+    _integrationControl?.emit('runtime_state', {
+      'state': 'display_name_updated',
+      'name': name,
+    });
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _resetIntegrationState() async {
+    // Reset only app-level test state. The LPC identity remains persistent so
+    // reconnect scenarios exercise the same authenticated peer identity.
+    for (final decision in _pendingFriendDecisions.values) {
+      if (!decision.isCompleted) decision.complete(false);
+    }
+    _pendingFriendDecisions.clear();
+    for (final timer in _friendRequestTimers.values) {
+      timer.cancel();
+    }
+    _friendRequestTimers.clear();
+    for (final id in {..._friends.keys, ..._connections.keys}) {
+      final peer = PeerId(_unhex(id));
+      await _host?.disconnect(peer, reason: 'INTEGRATION_RESET');
+      await _runtime?.releasePeerRetention(peer);
+    }
+    _friends.clear();
+    _nearby.clear();
+    _unnamedNearby.clear();
+    _identifiedEndpointNames.clear();
+    _endpointPeers.clear();
+    _endpointSeenAt.clear();
+    _connectUiStates.clear();
+    _connections.clear();
+    _identifyingEndpoints.clear();
+    _inboundFriendRequests.clear();
+    _pending.clear();
+    _handled.clear();
+    _lines.clear();
+    _receivedMessages.clear();
+    _nextReceivedMessage = 1;
+    _unreadByFriend.clear();
+    _newFriends.clear();
+    _expandedChats.clear();
+    _selected.clear();
+    _group?.leave();
+    _group = null;
+    _groupDemoId = null;
+    unawaited(_groupSub?.cancel());
+    _groupSub = null;
+    await _save();
+    _integrationControl?.emit('test_state', {'state': 'reset'});
+    if (mounted) setState(() {});
   }
 
   void _expireEndpoints() {
@@ -108,6 +315,7 @@ class _MessagingPageState extends State<MessagingPage> {
     _logs.insert(0, '$timestamp  $message');
     if (_logs.length > 100) _logs.removeLast();
     debugPrint('[LPC Demo][$timestamp] $message');
+    _integrationControl?.emit('diagnostic', {'message': message});
   }
 
   // Direct actions need immediate feedback even though the Nearby page no
@@ -223,6 +431,7 @@ class _MessagingPageState extends State<MessagingPage> {
       _log('Host advertising started');
       _discovery = await _runtime!.startDiscovery();
       _log('Runtime started: symmetric advertising/listening and discovery');
+      _integrationControl?.emit('runtime_state', {'state': 'discovery_active'});
     } catch (e) {
       _log('Startup failed: $e');
     }
@@ -335,6 +544,11 @@ class _MessagingPageState extends State<MessagingPage> {
       rssi: previous?.rssi ?? -127,
       localName: name,
     );
+    _integrationControl?.emit('discovery_endpoint', {
+      'endpointId': endpointId,
+      'name': name,
+      'authenticated': true,
+    });
   }
 
   void _runtimeEvent(RuntimeEvent e) {
@@ -453,6 +667,11 @@ class _MessagingPageState extends State<MessagingPage> {
   void _presence(String id, _Presence p, String what) {
     if (_friends[id] != null) _friends[id]!.presence = p;
     _log('$what $id');
+    _integrationControl?.emit('peer_state', {
+      'peerId': id,
+      'state': p.name,
+      'reason': what,
+    });
     if (mounted) setState(() {});
   }
 
@@ -654,7 +873,10 @@ class _MessagingPageState extends State<MessagingPage> {
     }
     if (!mounted) return;
     _inboundFriendRequests.add(id);
-    final yes = await showDialog<bool>(
+    final controlDecision = Completer<bool>();
+    _pendingFriendDecisions[id] = controlDecision;
+    var dialogCompleted = false;
+    final dialogDecision = showDialog<bool>(
       context: context,
       barrierDismissible: false,
       builder: (c) => AlertDialog(
@@ -674,6 +896,21 @@ class _MessagingPageState extends State<MessagingPage> {
         ],
       ),
     );
+    dialogDecision.whenComplete(() => dialogCompleted = true);
+    _integrationControl?.emit('friendship_prompt', {
+      'peerId': id,
+      'name': name,
+      'state': 'pending',
+    });
+    final yes = await Future.any<bool>([
+      dialogDecision.then((value) => value == true),
+      controlDecision.future,
+    ]);
+    if (controlDecision.isCompleted && !dialogCompleted && mounted) {
+      // The host command has made the decision; close the visible prompt so
+      // the physical device and the test-control state cannot diverge.
+      Navigator.of(context).pop();
+    }
     try {
       if (yes == true) {
         _friends[id] = _Friend(id, name, _Presence.online);
@@ -686,6 +923,12 @@ class _MessagingPageState extends State<MessagingPage> {
       }
     } finally {
       _inboundFriendRequests.remove(id);
+      _pendingFriendDecisions.remove(id);
+      _integrationControl?.emit('friendship_prompt', {
+        'peerId': id,
+        'name': name,
+        'state': yes ? 'accepted' : 'declined',
+      });
     }
   }
 
@@ -754,16 +997,27 @@ class _MessagingPageState extends State<MessagingPage> {
           _unreadByFriend[id] = (_unreadByFriend[id] ?? 0) + 1;
         }
       });
+      final message = <String, Object?>{
+        'messageId': 'received-${_nextReceivedMessage++}',
+        'peerId': id,
+        'conversationId': _hex(chat.id),
+        'textLength': chat.text.length,
+        'textSha256': await _sha256Hex(chat.text),
+      };
+      _receivedMessages.add(message);
+      _integrationControl?.emit('message_received', message);
     }
   }
 
-  Future<void> _sendDirect(String id) async {
-    final text = _direct.text.trim(), peer = _connections[id];
-    if (text.isEmpty) return;
+  Future<SendState?> _sendDirect(String id, [String? requestedText]) async {
+    final text = (requestedText ?? _direct.text).trim(),
+        peer = _connections[id];
+    if (text.isEmpty) return null;
     if (peer == null || peer.state != PeerConnectionState.ready) {
       _log('Direct message not sent: friend $id is offline');
-      _showUserFeedback('Message not sent: friend is offline');
-      return;
+      if (requestedText == null)
+        _showUserFeedback('Message not sent: friend is offline');
+      return null;
     }
     final result = await _send(
       peer,
@@ -777,11 +1031,19 @@ class _MessagingPageState extends State<MessagingPage> {
     );
     if (result != SendState.remoteAcknowledged &&
         result != SendState.sentToTransport) {
-      _showUserFeedback('Message could not be delivered');
-      return;
+      if (requestedText == null)
+        _showUserFeedback('Message could not be delivered');
+      return result;
     }
-    _direct.clear();
+    if (requestedText == null) _direct.clear();
     if (mounted) setState(() => _lines.add(_Line(true, id, text, false)));
+    _integrationControl?.emit('message_sent', {
+      'peerId': id,
+      'state': result?.name,
+      'textLength': text.length,
+      'textSha256': await _sha256Hex(text),
+    });
+    return result;
   }
 
   Future<void> _inviteIn(PeerConnection peer, Uint8List p) async {
@@ -1057,6 +1319,7 @@ class _MessagingPageState extends State<MessagingPage> {
     unawaited(_discovery?.stop());
     unawaited(_host?.close());
     unawaited(_runtime?.close());
+    unawaited(_integrationControl?.stop());
     super.dispose();
   }
 
@@ -1440,6 +1703,9 @@ Future<Uint8List> _directId(PeerId l, PeerId r) async {
   final h = await Sha256().hash([...ascii.encode('LPC-DEMO-DIRECT-1'), ...o]);
   return Uint8List.fromList(h.bytes.take(16).toList());
 }
+
+Future<String> _sha256Hex(String value) async =>
+    _hex((await Sha256().hash(utf8.encode(value))).bytes);
 
 int _compare(List<int> a, List<int> b) {
   for (var i = 0; i < a.length; i++) {
