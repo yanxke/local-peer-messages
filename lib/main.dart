@@ -55,6 +55,8 @@ class _MessagingPageState extends State<MessagingPage> {
   final _lines = <_Line>[];
   final _receivedMessages = <Map<String, Object?>>[];
   int _nextReceivedMessage = 1;
+  int _unreadGroupMessages = 0;
+  bool _newGroup = false;
   final _identifyingEndpoints = <String>{};
   final _inboundFriendRequests = <String>{};
   final _friendRequestTimers = <String, Timer>{};
@@ -137,6 +139,8 @@ class _MessagingPageState extends State<MessagingPage> {
     'pendingFriendResponses': _pending.keys.toList(growable: false),
     'messagesReceived': List.unmodifiable(_receivedMessages),
     'messageCount': _lines.length,
+    'newGroup': _newGroup,
+    'unreadGroupMessages': _unreadGroupMessages,
     'logs': _logs.take(50).toList(growable: false),
   };
 
@@ -274,6 +278,8 @@ class _MessagingPageState extends State<MessagingPage> {
     _lines.clear();
     _receivedMessages.clear();
     _nextReceivedMessage = 1;
+    _unreadGroupMessages = 0;
+    _newGroup = false;
     _unreadByFriend.clear();
     _newFriends.clear();
     _expandedChats.clear();
@@ -1120,13 +1126,15 @@ class _MessagingPageState extends State<MessagingPage> {
     );
     _groupSub = _group!.events.listen(_groupEvent);
     _log('Group Demo active: OPEN_TOFU is not a private room');
+    if (_tab != 2) _newGroup = true;
     if (mounted) setState(() {});
   }
 
   void _groupEvent(GroupEvent e) {
-    if (e is GroupReady)
+    if (e is GroupReady) {
       _log('GroupReady coordinator=${e.coordinatorPeerId}');
-    else if (e is MemberJoined)
+      if (_tab != 2) _newGroup = true;
+    } else if (e is MemberJoined)
       _log('MemberJoined ${e.member.peerId}');
     else if (e is MemberLeft)
       _log('MemberLeft ${e.peerId}');
@@ -1142,11 +1150,18 @@ class _MessagingPageState extends State<MessagingPage> {
       if (c != null &&
           c.group &&
           _groupDemoId != null &&
-          _same(c.id, _groupDemoId!))
-        setState(
-          () =>
-              _lines.add(_Line(false, e.sourcePeerId.toString(), c.text, true)),
-        );
+          _same(c.id, _groupDemoId!)) {
+        if (mounted) {
+          setState(() {
+            _lines.add(_Line(false, e.sourcePeerId.toString(), c.text, true));
+            if (_tab != 2) _unreadGroupMessages++;
+          });
+        }
+        _integrationControl?.emit('group_message_received', {
+          'peerId': e.sourcePeerId.toString(),
+          'textLength': c.text.length,
+        });
+      }
     }
     if (mounted) setState(() {});
   }
@@ -1348,15 +1363,17 @@ class _MessagingPageState extends State<MessagingPage> {
           // updates; it deliberately has no network read-receipt protocol.
           _unreadByFriend.clear();
           _newFriends.clear();
+        } else if (v == 2) {
+          // Group notifications are local-only indicators; opening Group
+          // Demo marks the available group and its messages read.
+          _newGroup = false;
+          _unreadGroupMessages = 0;
         }
       }),
       destinations: [
         const NavigationDestination(icon: Icon(Icons.radar), label: 'Nearby'),
         NavigationDestination(icon: _chatNavigationIcon, label: 'Chats'),
-        const NavigationDestination(
-          icon: Icon(Icons.groups_outlined),
-          label: 'Group Demo',
-        ),
+        NavigationDestination(icon: _groupNavigationIcon, label: 'Group Demo'),
         const NavigationDestination(
           icon: Icon(Icons.monitor_heart_outlined),
           label: 'Diagnostics',
@@ -1432,6 +1449,15 @@ class _MessagingPageState extends State<MessagingPage> {
       isLabelVisible: count > 0,
       label: Text(count > 99 ? '99+' : '$count'),
       child: const Icon(Icons.chat_bubble_outline),
+    );
+  }
+
+  Widget get _groupNavigationIcon {
+    final count = (_newGroup ? 1 : 0) + _unreadGroupMessages;
+    return Badge(
+      isLabelVisible: count > 0,
+      label: Text(count > 99 ? '99+' : '$count'),
+      child: const Icon(Icons.groups_outlined),
     );
   }
 
@@ -1563,7 +1589,11 @@ class _MessagingPageState extends State<MessagingPage> {
           TextButton(
             onPressed: () {
               g.leave();
-              setState(() => _group = null);
+              setState(() {
+                _group = null;
+                _newGroup = false;
+                _unreadGroupMessages = 0;
+              });
             },
             child: const Text('Leave Group Demo'),
           ),

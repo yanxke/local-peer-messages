@@ -60,8 +60,9 @@ def run_pairing_chat(
         "incoming friendship prompt",
         timeout,
     )
-    secondary_peer_id = pending["pendingFriendRequests"][0]
-    second.command("acceptFriend", {"peerId": secondary_peer_id})
+    requester_peer_id = pending["pendingFriendRequests"][0]
+    secondary_peer_id = pending["localPeerId"]
+    second.command("acceptFriend", {"peerId": requester_peer_id})
     first_snapshot = first.wait_for(
         lambda s: bool(s.get("friends")) and bool(s.get("localPeerId")),
         "primary friendship record",

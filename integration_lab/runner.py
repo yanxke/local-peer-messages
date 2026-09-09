@@ -60,9 +60,21 @@ def _command(args: list[str], timeout: float = 600) -> None:
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
+    if path.is_dir():
+        # iOS debug output is an app bundle directory. Include relative file
+        # names so two bundles with identical bytes but different layouts do
+        # not accidentally receive the same artifact hash.
+        files = sorted(item for item in path.rglob("*") if item.is_file())
+        for item in files:
+            digest.update(item.relative_to(path).as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            with item.open("rb") as stream:
+                for block in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(block)
+    else:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
     return digest.hexdigest()
 
 
@@ -154,7 +166,11 @@ def main() -> int:
                 controls[device.name] = AppControl(
                     f"http://127.0.0.1:{device.host_port}", device.name
                 )
-            deadline = time.monotonic() + 30
+            # iOS debug deployment must be attached by Flutter tooling and
+            # can spend over 30 seconds installing/signing before the control
+            # server becomes reachable. Keep this infrastructure wait bounded
+            # but separate from the scenario's Bluetooth timeout.
+            deadline = time.monotonic() + max(120, options.timeout)
             for name, control in controls.items():
                 while True:
                     try:
@@ -181,7 +197,7 @@ def main() -> int:
                 raise RuntimeError(f"unsupported scenario {options.scenario}")
             result.update({"status": "passed", "outcome": outcome})
             return_code = 0
-    except (ControlError, DeviceError, RuntimeError) as error:
+    except (ControlError, DeviceError, RuntimeError, OSError) as error:
         result.update({"status": "failed", "error": str(error)})
         print(f"Scenario failed: {error}", file=sys.stderr, flush=True)
         return_code = 1

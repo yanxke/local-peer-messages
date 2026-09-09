@@ -28,7 +28,7 @@ class AppControl:
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
                 result = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError) as error:
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise ControlError(f"{self.device_name}: {path}: {error}") from error
         if not isinstance(result, dict) or result.get("ok") is False:
             raise ControlError(f"{self.device_name}: {path}: {result}")

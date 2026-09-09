@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shutil
 import subprocess
 import time
@@ -32,6 +33,7 @@ class Device:
         self.config = config
         self.host_port = host_port
         self._bridge_process: subprocess.Popen[str] | None = None
+        self._launcher_process: subprocess.Popen[str] | None = None
 
     @property
     def name(self) -> str:
@@ -96,6 +98,34 @@ class Device:
         }
 
     def close(self) -> None:
+        if self._launcher_process is not None:
+            # `flutter run --machine` exits when its command stream reaches
+            # EOF. Keep that stream open for the scenario, then close it
+            # before terminating the process group so Flutter can shut down
+            # its device session cleanly.
+            if self._launcher_process.stdin is not None:
+                try:
+                    self._launcher_process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                if os.name == "posix":
+                    os.killpg(os.getpgid(self._launcher_process.pid), signal.SIGTERM)
+                else:
+                    self._launcher_process.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                self._launcher_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    if os.name == "posix":
+                        os.killpg(os.getpgid(self._launcher_process.pid), signal.SIGKILL)
+                    else:
+                        self._launcher_process.kill()
+                except ProcessLookupError:
+                    pass
+            self._launcher_process = None
         if self._bridge_process is not None:
             self._bridge_process.terminate()
             try:
@@ -127,7 +157,14 @@ class AndroidDevice(Device):
         self._adb("shell", "am", "force-stop", ANDROID_PACKAGE)
 
     def start_bridge(self) -> None:
-        self._adb("forward", "--remove", f"tcp:{self.host_port}")
+        # `adb forward --remove` exits non-zero when this is the first run or
+        # a previous runner already cleaned up the listener.  Treat that
+        # expected absence as idempotent, while preserving real ADB errors.
+        try:
+            self._adb("forward", "--remove", f"tcp:{self.host_port}")
+        except DeviceError as error:
+            if "listener 'tcp:" not in str(error) or "not found" not in str(error):
+                raise
         self._adb("forward", f"tcp:{self.host_port}", f"tcp:{APP_CONTROL_PORT}")
 
     def collect_logs(self, output: Path) -> None:
@@ -193,20 +230,40 @@ class IosDevice(Device):
             timeout=180,
         )
 
+    def prepare(self, artifact: Path) -> None:
+        if not self.connected():
+            raise DeviceError(f"{self.name}: device is not connected and authorized")
+        # A debug Flutter app cannot be reliably installed/launched through a
+        # standalone devicectl install followed by process launch. Flutter's
+        # attached runner must own the install and debug-session handshake.
+        self.wake()
+        self.launch()
+        self.start_bridge()
+
     def launch(self) -> None:
-        self.run(
+        # iOS refuses to launch a debug Flutter app through devicectl; it must
+        # be launched and kept attached by Flutter tooling (or Xcode). Keep
+        # this process alive for the scenario so the debug VM and app control
+        # server remain active while iproxy forwards the test commands.
+        self._launcher_process = subprocess.Popen(
             [
-                "xcrun",
-                "devicectl",
-                "device",
-                "process",
-                "launch",
-                "--device",
+                "flutter",
+                "run",
+                "--machine",
+                "--device-id",
                 self.config.serial,
-                "--terminate-existing",
-                IOS_BUNDLE_ID,
+                "--debug",
+                "--no-pub",
             ],
-            timeout=60,
+            cwd=Path(__file__).resolve().parents[1],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            # Machine mode uses stdin as a command stream. An inherited or
+            # closed stdin can look like EOF and make Flutter print
+            # "Exiting..." immediately, which drops the app's control server.
+            stdin=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
         )
 
     def stop(self) -> None:

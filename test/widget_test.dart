@@ -12,6 +12,12 @@ void main() {
     expect(find.text('Diagnostics'), findsOneWidget);
     expect(find.textContaining('LPC security:'), findsNothing);
     expect(find.textContaining('Nearby discovery active'), findsNothing);
+    expect(
+      find.byWidgetPredicate(
+        (widget) => widget is Badge && !widget.isLabelVisible,
+      ),
+      findsNWidgets(2),
+    );
   });
 
   testWidgets('direct action failures are shown as transient feedback', (
