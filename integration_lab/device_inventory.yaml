@@ -1,7 +1,7 @@
 devices:
   peer_a:
     platform: android
-    serial: R5CR614LNCE
+    serial: 1f07ac7e
     role: primary
   peer_b:
     platform: ios

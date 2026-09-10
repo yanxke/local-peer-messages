@@ -54,6 +54,7 @@ class _MessagingPageState extends State<MessagingPage> {
       _logs = <String>[];
   final _lines = <_Line>[];
   final _receivedMessages = <Map<String, Object?>>[];
+  final _receivedGroupMessages = <Map<String, Object?>>[];
   int _nextReceivedMessage = 1;
   int _unreadGroupMessages = 0;
   bool _newGroup = false;
@@ -77,6 +78,7 @@ class _MessagingPageState extends State<MessagingPage> {
   Timer? _endpointExpiryTimer;
   final _peerSubs = <StreamSubscription<dynamic>>[];
   final _pendingFriendDecisions = <String, Completer<bool>>{};
+  final _pendingGroupInvites = <String, _PendingGroupInvite>{};
   String _name = '';
   int _tab = 0;
 
@@ -136,11 +138,43 @@ class _MessagingPageState extends State<MessagingPage> {
         },
     ],
     'pendingFriendRequests': _inboundFriendRequests.toList(growable: false),
-    'pendingFriendResponses': _pending.keys.toList(growable: false),
+    // Keep only requests that are still awaiting a response. The map retains
+    // empty sets briefly after a response so timer cleanup can be idempotent;
+    // exposing those keys made integration tests report a rejected request as
+    // still pending even after FRIEND_REJECT had been received.
+    'pendingFriendResponses': [
+      for (final entry in _pending.entries)
+        if (entry.value.isNotEmpty) entry.key,
+    ],
+    // A pending invite is exposed so a real-device test can make the same
+    // explicit Join/Decline decision as the visible dialog.
+    'pendingGroupInvites': _pendingGroupInvites.keys.toList(growable: false),
     'messagesReceived': List.unmodifiable(_receivedMessages),
+    // Group traffic has a different routing/envelope path from direct chat;
+    // keep it separate so integration tests cannot mistake one for the other.
+    'groupMessagesReceived': List.unmodifiable(_receivedGroupMessages),
     'messageCount': _lines.length,
     'newGroup': _newGroup,
     'unreadGroupMessages': _unreadGroupMessages,
+    'group': _group == null
+        ? null
+        : {
+            'applicationGroupId': _groupDemoId == null
+                ? null
+                : _hex(_groupDemoId!),
+            'lpcGroupId': _hex(_group!.groupId.bytes),
+            'state': _group!.state.name,
+            'coordinatorPeerId': _group!.coordinatorPeerId?.toString(),
+            'coordinatorTerm': _group!.coordinatorTerm,
+            'isCoordinator': _group!.isCoordinator,
+            'members': [
+              for (final member in _group!.members)
+                {
+                  'peerId': member.peerId.toString(),
+                  'maxPeers': member.maxPeers,
+                },
+            ],
+          },
     'logs': _logs.take(50).toList(growable: false),
   };
 
@@ -171,8 +205,32 @@ class _MessagingPageState extends State<MessagingPage> {
           true,
         );
         return await _integrationSnapshot();
+      case 'requestFriendship':
+        final peerId = _requiredArgument(arguments, 'peerId');
+        final peer = _connections[peerId];
+        if (peer == null || peer.state != PeerConnectionState.ready) {
+          throw StateError('ready peer is not connected: $peerId');
+        }
+        // The force form is integration-only and sends a second request over
+        // an existing authenticated connection so the receiver's idempotent
+        // already-a-friend path can be tested without deleting its transport
+        // ownership or changing normal UI behavior.
+        await _request(peer, allowExistingFriend: arguments['force'] == true);
+        return await _integrationSnapshot();
       case 'declineFriend':
         await _decideIntegrationFriendRequest(
+          _requiredArgument(arguments, 'peerId'),
+          false,
+        );
+        return await _integrationSnapshot();
+      case 'acceptGroupInvite':
+        await _decideIntegrationGroupInvite(
+          _requiredArgument(arguments, 'peerId'),
+          true,
+        );
+        return await _integrationSnapshot();
+      case 'declineGroupInvite':
+        await _decideIntegrationGroupInvite(
           _requiredArgument(arguments, 'peerId'),
           false,
         );
@@ -194,6 +252,57 @@ class _MessagingPageState extends State<MessagingPage> {
           throw StateError('direct message was not delivered');
         }
         return {'sendState': result?.name};
+      case 'createGroup':
+        await _createGroup(
+          _requiredHexBytes(arguments, 'groupId', 16),
+          _requiredHexBytes(arguments, 'joinToken', 16),
+          _requiredIntArgument(arguments, 'maxPeers', minimum: 2, maximum: 8),
+        );
+        return await _integrationSnapshot();
+      case 'sendGroupInvite':
+        await _sendIntegrationGroupInvite(arguments);
+        return await _integrationSnapshot();
+      case 'sendRawApplicationBytes':
+        final id = _requiredArgument(arguments, 'peerId');
+        final peer = _connections[id];
+        if (peer == null || peer.state != PeerConnectionState.ready) {
+          throw StateError('ready peer is not connected: $id');
+        }
+        final result = await _sendRawApplicationBytes(
+          peer,
+          _requiredHexList(arguments, 'hex'),
+        );
+        if (result != SendState.remoteAcknowledged &&
+            result != SendState.sentToTransport) {
+          throw StateError('raw application bytes were not delivered');
+        }
+        return {'sendState': result?.name};
+      case 'removeFriendLocalOnly':
+        // This command represents an already-confirmed local deletion in the
+        // integration harness. It intentionally does not send FRIEND_REMOVE,
+        // allowing IT-DEMO-REMOVED-FRIEND-AUTHORIZATION to verify that the
+        // remote app's stale FriendRecord cannot authorize application data.
+        final id = _requiredArgument(arguments, 'peerId');
+        if (!_friends.containsKey(id)) {
+          throw StateError('friend record is not present: $id');
+        }
+        await _removeFriendRecord(id, reason: 'INTEGRATION_LOCAL_REMOVE');
+        return await _integrationSnapshot();
+      case 'removeFriend':
+        // The integration harness treats this command as the user's explicit
+        // confirmation; the visible UI continues to require the dialog.
+        final id = _requiredArgument(arguments, 'peerId');
+        if (!_friends.containsKey(id)) {
+          throw StateError('friend record is not present: $id');
+        }
+        await _removeFriend(id, notifyRemote: true);
+        return await _integrationSnapshot();
+      case 'sendGroupMessage':
+        await _sendGroup(_requiredArgument(arguments, 'text'));
+        return await _integrationSnapshot();
+      case 'leaveGroup':
+        await _leaveGroup();
+        return await _integrationSnapshot();
       case 'disconnectPeer':
         final id = _requiredArgument(arguments, 'peerId');
         final peer = PeerId(_unhex(id));
@@ -216,12 +325,81 @@ class _MessagingPageState extends State<MessagingPage> {
     return value;
   }
 
+  Uint8List _requiredHexBytes(
+    Map<String, Object?> arguments,
+    String key,
+    int length,
+  ) {
+    final value = _requiredArgument(arguments, key);
+    if (value.length != length * 2 ||
+        !RegExp(r'^[0-9a-fA-F]+$').hasMatch(value)) {
+      throw ArgumentError('$key must be $length bytes of hexadecimal');
+    }
+    return Uint8List.fromList(_unhex(value));
+  }
+
+  Uint8List _requiredHexList(Map<String, Object?> arguments, String key) {
+    final value = _requiredArgument(arguments, key);
+    if (value.length.isOdd || !RegExp(r'^[0-9a-fA-F]+$').hasMatch(value)) {
+      throw ArgumentError(
+        '$key must contain an even number of hexadecimal digits',
+      );
+    }
+    return Uint8List.fromList(_unhex(value));
+  }
+
+  int _requiredIntArgument(
+    Map<String, Object?> arguments,
+    String key, {
+    required int minimum,
+    required int maximum,
+  }) {
+    final value = arguments[key];
+    if (value is! int || value < minimum || value > maximum) {
+      throw ArgumentError(
+        '$key must be an integer from $minimum through $maximum',
+      );
+    }
+    return value;
+  }
+
   Future<void> _decideIntegrationFriendRequest(String id, bool accepted) async {
     final decision = _pendingFriendDecisions[id];
     if (decision == null || decision.isCompleted) {
       throw StateError('no pending friendship prompt for peer $id');
     }
     decision.complete(accepted);
+  }
+
+  Future<void> _decideIntegrationGroupInvite(String id, bool accepted) async {
+    final invite = _pendingGroupInvites[id];
+    if (invite == null || invite.decision.isCompleted) {
+      throw StateError('no pending Group Demo invite for peer $id');
+    }
+    invite.decision.complete(accepted);
+  }
+
+  Future<void> _sendIntegrationGroupInvite(
+    Map<String, Object?> arguments,
+  ) async {
+    final id = _requiredArgument(arguments, 'peerId');
+    final peer = _connections[id];
+    if (peer == null || peer.state != PeerConnectionState.ready) {
+      throw StateError('ready peer is not connected: $id');
+    }
+    final groupId = _requiredHexBytes(arguments, 'groupId', 16);
+    final joinToken = _requiredHexBytes(arguments, 'joinToken', 16);
+    final maxPeers = _requiredIntArgument(
+      arguments,
+      'maxPeers',
+      minimum: 2,
+      maximum: 8,
+    );
+    final result = await _sendGroupInvite(id, groupId, joinToken, maxPeers);
+    if (result != SendState.remoteAcknowledged &&
+        result != SendState.sentToTransport) {
+      throw StateError('Group Demo invite was not delivered');
+    }
   }
 
   Future<void> _setIntegrationDisplayName(String value) async {
@@ -254,14 +432,32 @@ class _MessagingPageState extends State<MessagingPage> {
       if (!decision.isCompleted) decision.complete(false);
     }
     _pendingFriendDecisions.clear();
+    for (final invite in _pendingGroupInvites.values) {
+      if (!invite.decision.isCompleted) invite.decision.complete(false);
+    }
+    _pendingGroupInvites.clear();
     for (final timer in _friendRequestTimers.values) {
       timer.cancel();
     }
     _friendRequestTimers.clear();
     for (final id in {..._friends.keys, ..._connections.keys}) {
       final peer = PeerId(_unhex(id));
-      await _host?.disconnect(peer, reason: 'INTEGRATION_RESET');
-      await _runtime?.releasePeerRetention(peer);
+      // Reset is deliberately idempotent. A platform callback can mark a
+      // logical peer disconnected just before this cleanup reaches the old
+      // endpoint, so ENDPOINT_LOST/TRANSPORT_CLOSED is expected here and
+      // must not turn the reset command into an HTTP 400 failure.
+      try {
+        await _host?.disconnect(peer, reason: 'INTEGRATION_RESET');
+      } catch (error) {
+        _log('Integration reset host cleanup ignored peer=$id error=$error');
+      }
+      try {
+        await _runtime?.releasePeerRetention(peer);
+      } catch (error) {
+        _log(
+          'Integration reset retention cleanup ignored peer=$id error=$error',
+        );
+      }
     }
     _friends.clear();
     _nearby.clear();
@@ -277,6 +473,7 @@ class _MessagingPageState extends State<MessagingPage> {
     _handled.clear();
     _lines.clear();
     _receivedMessages.clear();
+    _receivedGroupMessages.clear();
     _nextReceivedMessage = 1;
     _unreadGroupMessages = 0;
     _newGroup = false;
@@ -287,11 +484,53 @@ class _MessagingPageState extends State<MessagingPage> {
     _group?.leave();
     _group = null;
     _groupDemoId = null;
-    unawaited(_groupSub?.cancel());
+    await _groupSub?.cancel();
     _groupSub = null;
     await _save();
+    // A persisted friend can already have triggered LPC's automatic probe
+    // before this debug reset command arrives. Clearing the app map cannot
+    // cancel that in-flight probe, so restart the runtime to establish a
+    // genuinely quiescent test boundary while retaining the device identity.
+    await _restartRuntimeForIntegrationReset();
     _integrationControl?.emit('test_state', {'state': 'reset'});
     if (mounted) setState(() {});
+  }
+
+  Future<void> _restartRuntimeForIntegrationReset() async {
+    Future<void> ignoreFailure(
+      String operation,
+      Future<void> Function() action,
+    ) async {
+      try {
+        await action();
+      } catch (error) {
+        // Reset is a test boundary: shutdown races with transport callbacks
+        // are expected and must not make resetTestState return HTTP 400.
+        _log('Integration reset $operation cleanup ignored error=$error');
+      }
+    }
+
+    await ignoreFailure('discovery.stop', () async {
+      await _discovery?.stop();
+    });
+    _discovery = null;
+    await ignoreFailure('host.close', () async {
+      await _host?.close();
+    });
+    _host = null;
+    await _runtimeSub?.cancel();
+    _runtimeSub = null;
+    await _backendSub?.cancel();
+    _backendSub = null;
+    for (final subscription in _peerSubs) {
+      await subscription.cancel();
+    }
+    _peerSubs.clear();
+    await ignoreFailure('runtime.close', () async {
+      await _runtime?.close();
+    });
+    _runtime = null;
+    await _start();
   }
 
   void _expireEndpoints() {
@@ -446,12 +685,13 @@ class _MessagingPageState extends State<MessagingPage> {
   void _onHostPeerConnected(PeerConnection peer, String? endpointId) {
     if (endpointId != null) _rememberConnectedEndpoint(peer, endpointId);
     _attach(peer, 'PeerConnected');
+    _maybeRequestFriendship(peer, endpointId);
     // An inbound connection used solely by the remote device's automatic
     // discovery identification must not keep the persistent HostSession
     // reconnecting forever. Keep it long enough for a real FRIEND_REQUEST to
     // arrive, then release only HostSession ownership if no relationship flow
     // began.
-    Timer(const Duration(seconds: 8), () {
+    Timer(const Duration(seconds: 30), () {
       final id = peer.peerId.toString();
       if (_friends.containsKey(id) || _inboundFriendRequests.contains(id)) {
         return;
@@ -572,6 +812,7 @@ class _MessagingPageState extends State<MessagingPage> {
         if (discoveryEndpointId != null) {
           _rememberConnectedEndpoint(connection, discoveryEndpointId);
           _attach(connection, 'UnknownPeerIdentified');
+          _maybeRequestFriendship(connection, discoveryEndpointId);
           unawaited(
             _identifyPeer(
               connection,
@@ -596,6 +837,7 @@ class _MessagingPageState extends State<MessagingPage> {
           );
         }
         _attach(connection, 'KnownPeerConnected');
+        _maybeRequestFriendship(connection, discoveryEndpointId);
     }
   }
 
@@ -790,10 +1032,21 @@ class _MessagingPageState extends State<MessagingPage> {
     if (releaseRetention) await _runtime?.releasePeerRetention(peer.peerId);
   }
 
-  Future<void> _request(PeerConnection peer, {String? endpointId}) async {
+  Future<void> _request(
+    PeerConnection peer, {
+    String? endpointId,
+    bool allowExistingFriend = false,
+  }) async {
     final id = peer.peerId.toString();
-    if (_friends.containsKey(id) || peer.state != PeerConnectionState.ready)
+    if ((!allowExistingFriend && _friends.containsKey(id)) ||
+        peer.state != PeerConnectionState.ready)
       return;
+    // A user-directed Connect may race with symmetric discovery. The same
+    // authenticated peer can then arrive through the host side while the
+    // original central attempt is still completing. Keep one application
+    // FRIEND_REQUEST for that peer so both connection directions cannot create
+    // competing requests or leave the user waiting forever.
+    if (_pending[id]?.isNotEmpty == true) return;
     final request = _randomBytes(16);
     final requestKey = '$id:${_hex(request)}';
     _pending.putIfAbsent(id, () => {}).add(_hex(request));
@@ -812,7 +1065,11 @@ class _MessagingPageState extends State<MessagingPage> {
     if (endpointId != null && mounted) {
       setState(() => _connectUiStates[endpointId] = _ConnectUiState.waiting);
     }
+    _log('Sending FRIEND_REQUEST peer=$id request=${_hex(request)}');
     final result = await _send(peer, _friendRequest, request, 'FRIEND_REQUEST');
+    _log(
+      'FRIEND_REQUEST result peer=$id request=${_hex(request)} state=${result?.name ?? 'none'}',
+    );
     if (result == null ||
         result == SendState.failed ||
         result == SendState.cancelled) {
@@ -826,6 +1083,43 @@ class _MessagingPageState extends State<MessagingPage> {
       }
       return;
     }
+  }
+
+  void _maybeRequestFriendship(PeerConnection peer, String? endpointId) {
+    var requestEndpointId = endpointId;
+    if (requestEndpointId == null) {
+      // A simultaneous central/peripheral race can make the authenticated
+      // winner an inbound HostSession connection. That platform connection
+      // intentionally has no discovery-endpoint association (for example,
+      // CoreBluetooth reports it as server-N), even though the user's
+      // Connect action is still pending on the discovered outbound endpoint.
+      // Match the authenticated application name to that pending intent so
+      // the FRIEND_REQUEST uses the winning logical connection.
+      final name = _decodeMetadata(peer.remoteApplicationMetadata);
+      requestEndpointId = _nearby.entries
+          .where(
+            (entry) =>
+                entry.value.localName == name &&
+                _connectUiStates[entry.key] == _ConnectUiState.connecting,
+          )
+          .map((entry) => entry.key)
+          .firstOrNull;
+      if (requestEndpointId != null) {
+        _log(
+          'User Connect adopting inbound authenticated connection '
+          'endpoint=$requestEndpointId peer=${peer.peerId}',
+        );
+      }
+    }
+    if (requestEndpointId == null ||
+        _connectUiStates[requestEndpointId] != _ConnectUiState.connecting) {
+      return;
+    }
+    _log(
+      'User Connect adopting authenticated connection '
+      'endpoint=$requestEndpointId peer=${peer.peerId}',
+    );
+    unawaited(_request(peer, endpointId: requestEndpointId));
   }
 
   Future<void> _receive(
@@ -863,6 +1157,7 @@ class _MessagingPageState extends State<MessagingPage> {
   Future<void> _friendRequestIn(PeerConnection peer, Uint8List request) async {
     final id = peer.peerId.toString();
     if (request.length != 16 || !_handled.add('$id:${_hex(request)}')) return;
+    _log('Received FRIEND_REQUEST peer=$id request=${_hex(request)}');
     if (_friends.containsKey(id)) {
       await _send(peer, _friendAccept, request, 'FRIEND_ACCEPT idempotent');
       return;
@@ -908,6 +1203,7 @@ class _MessagingPageState extends State<MessagingPage> {
       'name': name,
       'state': 'pending',
     });
+    _log('Waiting for FRIEND_REQUEST decision peer=$id');
     final yes = await Future.any<bool>([
       dialogDecision.then((value) => value == true),
       controlDecision.future,
@@ -918,11 +1214,22 @@ class _MessagingPageState extends State<MessagingPage> {
       Navigator.of(context).pop();
     }
     try {
+      _log(
+        'FRIEND_REQUEST decision peer=$id request=${_hex(request)} accepted=$yes',
+      );
       if (yes == true) {
         _friends[id] = _Friend(id, name, _Presence.online);
         _newFriends.add(id);
         await _save();
-        await _send(peer, _friendAccept, request, 'FRIEND_ACCEPT');
+        final result = await _send(
+          peer,
+          _friendAccept,
+          request,
+          'FRIEND_ACCEPT',
+        );
+        _log(
+          'FRIEND_ACCEPT result peer=$id request=${_hex(request)} state=${result?.name ?? 'none'}',
+        );
         if (mounted) setState(() {});
       } else {
         await _send(peer, _friendReject, request, 'FRIEND_REJECT');
@@ -947,6 +1254,9 @@ class _MessagingPageState extends State<MessagingPage> {
     final requestKey = '$id:${_hex(request)}';
     if (request.length != 16 || !(_pending[id]?.remove(_hex(request)) ?? false))
       return _log('Ignored unmatched FRIEND response');
+    _log(
+      'Received FRIEND_${yes ? 'ACCEPT' : 'REJECT'} peer=$id request=${_hex(request)}',
+    );
     _friendRequestTimers.remove(requestKey)?.cancel();
     final displayName = _decodeMetadata(peer.remoteApplicationMetadata);
     for (final entry in _endpointPeers.entries) {
@@ -1053,7 +1363,8 @@ class _MessagingPageState extends State<MessagingPage> {
   }
 
   Future<void> _inviteIn(PeerConnection peer, Uint8List p) async {
-    if (!_friends.containsKey(peer.peerId.toString()) ||
+    final id = peer.peerId.toString();
+    if (!_friends.containsKey(id) ||
         peer.state != PeerConnectionState.ready ||
         p.length != 33 ||
         p[32] < 2 ||
@@ -1061,9 +1372,24 @@ class _MessagingPageState extends State<MessagingPage> {
       return _log('Ignored unauthorized/invalid Group Demo invite');
     if (_group != null)
       return _log('Ignored invite: Group Demo already active');
+    if (_pendingGroupInvites.containsKey(id))
+      return _log('Ignored duplicate Group Demo invite peer=$id');
     if (!mounted) return;
-    final yes = await showDialog<bool>(
+    final invite = _PendingGroupInvite(
+      peer,
+      Uint8List.fromList(p.sublist(0, 16)),
+      Uint8List.fromList(p.sublist(16, 32)),
+      p[32],
+    );
+    _pendingGroupInvites[id] = invite;
+    _integrationControl?.emit('group_invite', {
+      'peerId': id,
+      'state': 'pending',
+    });
+    var dialogCompleted = false;
+    final dialogDecision = showDialog<bool>(
       context: context,
+      barrierDismissible: false,
       builder: (c) => AlertDialog(
         title: const Text('Group Demo invitation'),
         content: const Text(
@@ -1081,12 +1407,26 @@ class _MessagingPageState extends State<MessagingPage> {
         ],
       ),
     );
-    if (yes == true)
-      _createGroup(
-        Uint8List.fromList(p.sublist(0, 16)),
-        Uint8List.fromList(p.sublist(16, 32)),
-        p[32],
-      );
+    dialogDecision.whenComplete(() => dialogCompleted = true);
+    final yes = await Future.any<bool>([
+      dialogDecision.then((value) => value == true),
+      invite.decision.future,
+    ]);
+    if (invite.decision.isCompleted && !dialogCompleted && mounted) {
+      // Keep the on-device prompt and the test-control decision in sync.
+      Navigator.of(context).pop();
+    }
+    try {
+      _integrationControl?.emit('group_invite', {
+        'peerId': id,
+        'state': yes ? 'accepted' : 'declined',
+      });
+      if (yes) {
+        await _createGroup(invite.groupId, invite.joinToken, invite.maxPeers);
+      }
+    } finally {
+      _pendingGroupInvites.remove(id);
+    }
   }
 
   Future<void> _createSelected() async {
@@ -1100,14 +1440,21 @@ class _MessagingPageState extends State<MessagingPage> {
     final gid = _randomBytes(16), token = _randomBytes(16);
     await _createGroup(gid, token, peers.length + 1);
     for (final id in peers) {
-      await _send(
-        _connections[id]!,
-        _invite,
-        Uint8List.fromList([...gid, ...token, peers.length + 1]),
-        'GROUP_DEMO_INVITE',
-      );
+      await _sendGroupInvite(id, gid, token, peers.length + 1);
     }
   }
+
+  Future<SendState?> _sendGroupInvite(
+    String id,
+    Uint8List groupId,
+    Uint8List joinToken,
+    int maxPeers,
+  ) => _send(
+    _connections[id]!,
+    _invite,
+    Uint8List.fromList([...groupId, ...joinToken, maxPeers]),
+    'GROUP_DEMO_INVITE',
+  );
 
   Future<void> _createGroup(Uint8List id, Uint8List token, int maxPeers) async {
     if (_group != null || _runtime == null) return;
@@ -1151,23 +1498,42 @@ class _MessagingPageState extends State<MessagingPage> {
           c.group &&
           _groupDemoId != null &&
           _same(c.id, _groupDemoId!)) {
+        unawaited(_recordGroupMessage(e, c.text));
         if (mounted) {
           setState(() {
             _lines.add(_Line(false, e.sourcePeerId.toString(), c.text, true));
             if (_tab != 2) _unreadGroupMessages++;
           });
         }
-        _integrationControl?.emit('group_message_received', {
-          'peerId': e.sourcePeerId.toString(),
-          'textLength': c.text.length,
-        });
+        unawaited(_emitGroupMessageReceived(e.sourcePeerId, c.text));
       }
     }
     if (mounted) setState(() {});
   }
 
-  Future<void> _sendGroup() async {
-    final text = _groupText.text.trim(), g = _group;
+  Future<void> _emitGroupMessageReceived(PeerId source, String text) async {
+    _integrationControl?.emit('group_message_received', {
+      'peerId': source.toString(),
+      'textSha256': await _sha256Hex(text),
+      'textLength': text.length,
+    });
+  }
+
+  Future<void> _recordGroupMessage(
+    ReliableMessageReceived event,
+    String text,
+  ) async {
+    final message = <String, Object?>{
+      'messageId': _hex(event.groupMessageId.bytes),
+      'peerId': event.sourcePeerId.toString(),
+      'textLength': text.length,
+      'textSha256': await _sha256Hex(text),
+    };
+    _receivedGroupMessages.add(message);
+  }
+
+  Future<void> _sendGroup([String? requestedText]) async {
+    final text = (requestedText ?? _groupText.text).trim(), g = _group;
     if (text.isEmpty ||
         g == null ||
         g.state != GroupState.ready ||
@@ -1183,7 +1549,7 @@ class _MessagingPageState extends State<MessagingPage> {
       _log(
         'Broadcast ${b.state.name}: ${b.results.values.map((h) => h.state.name).join(', ')}',
       );
-      _groupText.clear();
+      if (requestedText == null) _groupText.clear();
       if (mounted)
         setState(
           () => _lines.add(
@@ -1194,6 +1560,20 @@ class _MessagingPageState extends State<MessagingPage> {
       _log('Group send failed $e');
       if (mounted) _showUserFeedback('Group message could not be delivered');
     }
+  }
+
+  Future<void> _leaveGroup() async {
+    final group = _group;
+    if (group == null) return;
+    group.leave();
+    await _groupSub?.cancel();
+    _groupSub = null;
+    _group = null;
+    _groupDemoId = null;
+    _newGroup = false;
+    _unreadGroupMessages = 0;
+    _log('Group Demo left');
+    if (mounted) setState(() {});
   }
 
   Future<SendState?> _send(
@@ -1219,6 +1599,27 @@ class _MessagingPageState extends State<MessagingPage> {
     }
   }
 
+  Future<SendState?> _sendRawApplicationBytes(
+    PeerConnection peer,
+    Uint8List bytes,
+  ) async {
+    try {
+      final state = await peer
+          .send(
+            bytes,
+            options: const SendOptions(
+              deliveryMode: DeliveryMode.reliableAcked,
+            ),
+          )
+          .completed;
+      _log('RAW_APPLICATION_BYTES length=${bytes.length} ${state.name}');
+      return state;
+    } catch (error) {
+      _log('RAW_APPLICATION_BYTES length=${bytes.length} failed $error');
+      return null;
+    }
+  }
+
   Future<void> _remove(String id) async {
     final friend = _friends[id];
     if (friend == null || !mounted) return;
@@ -1240,10 +1641,15 @@ class _MessagingPageState extends State<MessagingPage> {
       ),
     );
     if (confirmed != true) return;
+    await _removeFriend(id, notifyRemote: true);
+  }
+
+  Future<void> _removeFriend(String id, {required bool notifyRemote}) async {
+    if (!_friends.containsKey(id)) return;
     final connection = _connections[id];
-    if (connection?.state == PeerConnectionState.ready) {
+    if (notifyRemote && connection?.state == PeerConnectionState.ready) {
       await _send(connection!, _friendRemove, const [], 'FRIEND_REMOVE');
-    } else {
+    } else if (notifyRemote) {
       _log('Friend removal is local only: peer is offline');
     }
     await _removeFriendRecord(id, reason: 'FRIEND_REMOVED');
@@ -1588,12 +1994,7 @@ class _MessagingPageState extends State<MessagingPage> {
           ),
           TextButton(
             onPressed: () {
-              g.leave();
-              setState(() {
-                _group = null;
-                _newGroup = false;
-                _unreadGroupMessages = 0;
-              });
+              unawaited(_leaveGroup());
             },
             child: const Text('Leave Group Demo'),
           ),
@@ -1641,6 +2042,15 @@ class _Friend {
     j['authenticatedName'] as String? ?? 'Unverified name',
     _Presence.offline,
   );
+}
+
+class _PendingGroupInvite {
+  _PendingGroupInvite(this.peer, this.groupId, this.joinToken, this.maxPeers);
+  final PeerConnection peer;
+  final Uint8List groupId;
+  final Uint8List joinToken;
+  final int maxPeers;
+  final decision = Completer<bool>();
 }
 
 class _Line {
