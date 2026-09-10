@@ -14,7 +14,9 @@ from typing import Any
 
 APP_CONTROL_PORT = 8765
 ANDROID_PACKAGE = "com.example.local_peer_messages"
+ANDROID_LPC_FIXTURE_PACKAGE = "com.example.integration_device_app"
 IOS_BUNDLE_ID = "com.example.localPeerMessages"
+IOS_LPC_FIXTURE_BUNDLE_ID = "com.example.integrationDeviceApp"
 
 
 class DeviceError(RuntimeError):
@@ -152,7 +154,31 @@ class AndroidDevice(Device):
         return result.stdout.strip() == "device"
 
     def install(self, artifact: Path) -> None:
-        self._adb("install", "-r", str(artifact), timeout=120)
+        try:
+            self._adb("install", "-r", str(artifact), timeout=120)
+        except DeviceError as error:
+            if "INSTALL_FAILED_INSUFFICIENT_STORAGE" not in str(error):
+                raise
+            # An update needs temporary room for both the new APK and the
+            # old package. On a nearly-full device, reclaim only this test
+            # app's package and retry; unrelated user apps and their data are
+            # never touched. A fresh install also gets a fresh identity, so
+            # the scenario's reset boundary remains explicit and repeatable.
+            self._adb("uninstall", ANDROID_PACKAGE, timeout=120)
+            self._adb("install", str(artifact), timeout=120)
+
+    def prepare(self, artifact: Path) -> None:
+        if not self.connected():
+            raise DeviceError(f"{self.name}: device is not connected and authorized")
+        # Keep the messenger run isolated from the standalone LPC fixture.
+        # Both apps advertise the same LPC service, so leaving the fixture
+        # alive creates indistinguishable nearby endpoints and endpoint-busy
+        # races on the peer under test.
+        self._adb("shell", "am", "force-stop", ANDROID_LPC_FIXTURE_PACKAGE)
+        self.install(artifact)
+        self.wake()
+        self.launch()
+        self.start_bridge()
 
     def launch(self) -> None:
         self._adb("shell", "am", "force-stop", ANDROID_PACKAGE)
@@ -390,24 +416,8 @@ class IosDevice(Device):
         # to an old process while the new flutter tool is still starting, and
         # its delayed "Exiting..." output is easy to misread as this launch.
         self._stop_orphan_flutter_launchers()
-        try:
-            self.run(
-                [
-                    "xcrun",
-                    "devicectl",
-                    "device",
-                    "process",
-                    "terminate",
-                    "--device",
-                    self.config.serial,
-                    IOS_BUNDLE_ID,
-                ],
-                timeout=30,
-            )
-        except DeviceError:
-            # The app is normally not running on the first launch. Keep the
-            # actual Flutter launch error visible through the readiness wait.
-            pass
+        self._terminate_installed_bundle(IOS_LPC_FIXTURE_BUNDLE_ID)
+        self._terminate_installed_bundle(IOS_BUNDLE_ID)
 
         # iOS refuses to launch a debug Flutter app through devicectl; it must
         # be launched and kept attached by Flutter tooling (or Xcode). Keep
@@ -446,6 +456,85 @@ class IosDevice(Device):
             raise DeviceError(
                 f"{self.name}: Flutter launcher exited immediately:\n{details[-4000:]}"
             )
+
+    def _terminate_installed_bundle(self, bundle_id: str) -> None:
+        """Terminate only running processes belonging to one exact bundle."""
+        apps_path = Path(f"/tmp/integration-lab-apps-{self.config.serial}.json")
+        processes_path = Path(
+            f"/tmp/integration-lab-processes-{self.config.serial}.json"
+        )
+        try:
+            self.run(
+                [
+                    "xcrun",
+                    "devicectl",
+                    "device",
+                    "info",
+                    "apps",
+                    "--device",
+                    self.config.serial,
+                    "--json-output",
+                    str(apps_path),
+                ],
+                timeout=30,
+            )
+            apps = json.loads(apps_path.read_text(encoding="utf-8"))
+            app = next(
+                (
+                    item
+                    for item in apps.get("result", {}).get("apps", [])
+                    if item.get("bundleIdentifier") == bundle_id
+                ),
+                None,
+            )
+            if not isinstance(app, dict):
+                return
+            app_root = str(app.get("url", "")).removeprefix("file://").rstrip("/")
+            if not app_root:
+                return
+            self.run(
+                [
+                    "xcrun",
+                    "devicectl",
+                    "device",
+                    "info",
+                    "processes",
+                    "--device",
+                    self.config.serial,
+                    "--json-output",
+                    str(processes_path),
+                ],
+                timeout=30,
+            )
+            processes = json.loads(processes_path.read_text(encoding="utf-8"))
+            for process in processes.get("result", {}).get("runningProcesses", []):
+                executable = str(process.get("executable", "")).removeprefix(
+                    "file://"
+                ).rstrip("/")
+                pid = process.get("processIdentifier")
+                if not executable.startswith(app_root) or not isinstance(pid, int):
+                    continue
+                try:
+                    self.run(
+                        [
+                            "xcrun",
+                            "devicectl",
+                            "device",
+                            "process",
+                            "terminate",
+                            "--device",
+                            self.config.serial,
+                            "--pid",
+                            str(pid),
+                        ],
+                        timeout=30,
+                    )
+                except DeviceError:
+                    # The process may exit between listing and termination.
+                    pass
+        finally:
+            apps_path.unlink(missing_ok=True)
+            processes_path.unlink(missing_ok=True)
 
     def stop(self) -> None:
         self.run(
@@ -486,6 +575,44 @@ class IosDevice(Device):
                 "ios device: iproxy is required for the USB control channel; install "
                 "libimobiledevice with `brew install libimobiledevice`"
             )
+        # A prior interrupted run can leave an iproxy child behind. Reclaim
+        # only a process that names this exact device and host port; never
+        # terminate an unrelated USB forward that another test may own.
+        mapping_prefix = f"{self.host_port}:"
+        process_list = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        for line in process_list.stdout.splitlines():
+            raw_pid, _, command = line.strip().partition(" ")
+            try:
+                pid = int(raw_pid)
+            except ValueError:
+                continue
+            if (
+                pid == os.getpid()
+                or "iproxy" not in command
+                or self.config.serial not in command
+                or mapping_prefix not in command
+            ):
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            for _ in range(10):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         self._bridge_process = subprocess.Popen(
             [iproxy, f"{self.host_port}:{APP_CONTROL_PORT}", "-u", self.config.serial],
             text=True,

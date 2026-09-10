@@ -672,13 +672,49 @@ class _MessagingPageState extends State<MessagingPage> {
           _log('Host event stream error: $error');
         },
       );
-      await _host!.startAdvertising();
-      _log('Host advertising started');
-      _discovery = await _runtime!.startDiscovery();
-      _log('Runtime started: symmetric advertising/listening and discovery');
-      _integrationControl?.emit('runtime_state', {'state': 'discovery_active'});
+      await _startNearbyServices();
     } catch (e) {
       _log('Startup failed: $e');
+    }
+  }
+
+  Future<void> _startNearbyServices() async {
+    final host = _host;
+    final runtime = _runtime;
+    if (host == null || runtime == null) {
+      throw StateError('runtime is not ready');
+    }
+    // CoreBluetooth can report .unknown for a short interval after the app
+    // receives permission, especially after a debug reinstall or device
+    // reconnect. Retry only BLUETOOTH_UNAVAILABLE; permission and other
+    // backend failures must remain visible instead of being hidden.
+    for (var attempt = 0; ; attempt++) {
+      try {
+        if (!host.isAdvertising) {
+          await host.startAdvertising();
+          _log('Host advertising started');
+        }
+        _discovery ??= await runtime.startDiscovery();
+        _log('Runtime started: symmetric advertising/listening and discovery');
+        _integrationControl?.emit('runtime_state', {
+          'state': 'discovery_active',
+        });
+        return;
+      } on LpcException catch (error) {
+        if (error.code != LpcErrorCode.bluetoothUnavailable || attempt >= 10) {
+          rethrow;
+        }
+        _log(
+          'Nearby startup retry ' +
+              (attempt + 1).toString() +
+              '/10: ' +
+              error.code.name +
+              ' (' +
+              (error.message ?? error.toString()) +
+              ')',
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      }
     }
   }
 
@@ -1087,14 +1123,16 @@ class _MessagingPageState extends State<MessagingPage> {
 
   void _maybeRequestFriendship(PeerConnection peer, String? endpointId) {
     var requestEndpointId = endpointId;
-    if (requestEndpointId == null) {
+    if (requestEndpointId == null ||
+        _connectUiStates[requestEndpointId] != _ConnectUiState.connecting) {
       // A simultaneous central/peripheral race can make the authenticated
       // winner an inbound HostSession connection. That platform connection
-      // intentionally has no discovery-endpoint association (for example,
-      // CoreBluetooth reports it as server-N), even though the user's
-      // Connect action is still pending on the discovered outbound endpoint.
-      // Match the authenticated application name to that pending intent so
-      // the FRIEND_REQUEST uses the winning logical connection.
+      // may have no discovery-endpoint association (for example,
+      // CoreBluetooth reports it as server-N), or it may be associated with
+      // a synthetic platform endpoint that does not equal the discovered
+      // endpoint. Match the authenticated application name to the pending
+      // user Connect intent so the FRIEND_REQUEST uses the winning logical
+      // connection in either case.
       final name = _decodeMetadata(peer.remoteApplicationMetadata);
       requestEndpointId = _nearby.entries
           .where(
@@ -1107,6 +1145,7 @@ class _MessagingPageState extends State<MessagingPage> {
       if (requestEndpointId != null) {
         _log(
           'User Connect adopting inbound authenticated connection '
+          'reportedEndpoint=${endpointId ?? 'none'} '
           'endpoint=$requestEndpointId peer=${peer.peerId}',
         );
       }
