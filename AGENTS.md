@@ -115,12 +115,21 @@ CI artifacts, not installation.
 
 If deployment hangs, inspect `ps aux | rg 'flutter run|devicectl|Runner.app|iproxy'`
 and terminate only the stale, device-specific Flutter/deployment/Runner
-process. On iOS 14+, debug Flutter apps must be launched through `flutter run`,
+process. If the app is frozen on the device after a termination signal, stop
+every stale messenger launch session for that device, not only the last
+`devicectl` child: old `flutter_tools.snapshot run -d <UDID>`, project-specific
+`xcode_debug.js`, and matching `devicectl` install/launch children can retain
+or relaunch the visible process. Then verify the app PID with
+`xcrun devicectl device info processes`, terminate that PID, and start exactly
+one `flutter run -d <UDID> --debug --no-pub` session. On iOS 14+, debug Flutter apps must be launched through `flutter run`,
 an IDE with the Flutter plugin, or Xcode; direct CoreDevice/devicectl launch
 is rejected. An in-place `xcrun devicectl device install app` can still be
 used for installation when appropriate, but not as the debug-app launch
 fallback. Do not reboot the phone, broadly kill CoreDevice, or stop a
-successful deployment session just to inspect it. If macOS Keychain authorization is requested for LPC identity
+successful deployment session just to inspect it. If the control-port
+`iproxy` accepts TCP connections but does not answer, restart only the
+matching `iproxy <local-port>:<control-port>` process after the new app is
+running; preserve forwards for other apps. If macOS Keychain authorization is requested for LPC identity
 storage, approve it (prefer “Always Allow”); `runtimeReady: false` while that
 prompt is present is an authorization wait, not a Bluetooth failure. A
 `MissingPluginException` for LPC seed loading requires a rebuild with the
