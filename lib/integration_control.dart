@@ -19,7 +19,7 @@ class IntegrationControlServer {
     required this.snapshot,
     required this.command,
     required this.logger,
-    this.port = 8765,
+    this.port = 8766,
   });
 
   final IntegrationSnapshot snapshot;

@@ -152,6 +152,30 @@ python3 -m integration_lab.runner --scenario burst_chat
 
 The `burst_chat` scenario submits five messages in each direction without
 waiting between sends, exercising queueing and message-stream serialization.
+For a bounded transport check using both 32-byte and 4096-byte messages in both
+directions, run:
+
+```sh
+python3 -m integration_lab.runner --scenario mixed_payload_chat
+```
+
+The mixed-payload scenario is bounded by five minutes and records hashes and
+sizes only, never message bodies. It uses the normative 32-byte and 4096-byte
+ChatMessageV1 sizes; the latter forces LPC fragmentation without exceeding the
+messenger protocol's 4096-byte text limit.
+
+To exercise a symmetric fixed-rate reliable traffic profile, with the producer
+timer running inside each app:
+
+```sh
+python3 -m integration_lab.runner --scenario fixed_rate_chat \
+  --traffic-seconds 30 --message-size 64 --messages-per-second 5
+```
+
+The fixed-rate scenario starts both bounded producers concurrently, verifies
+that both logical peers remain READY throughout the run, drains in-flight
+sends, and requires fewer than 10% failed sends. The size is limited to 32
+through 4096 bytes and the rate to 0.1 through 20 messages/second.
 To deliberately submit duplicate Connect actions during the same handshake:
 
 ```sh
@@ -188,7 +212,8 @@ POST /command {"action": "...", "arguments": {...}}
 
 Supported commands are `getSnapshot`, `resetTestState`, `setDisplayName`,
 `startNearby`, `connect`, `acceptFriend`, `declineFriend`, `createGroup`,
-`sendDirectMessage`, `sendGroupMessage`, and `disconnectPeer`.
+`sendDirectMessage`, `startDirectTraffic`, `stopDirectTraffic`,
+`sendGroupMessage`, and `disconnectPeer`.
 
 The smoke runner requires the devices to be unlocked, paired with the host,
 have Bluetooth permissions granted, and be close enough for discovery. A

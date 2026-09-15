@@ -32,6 +32,8 @@ from integration_lab.scenarios.friend_removal_notification import (
 )
 from integration_lab.scenarios.pairing_chat import run_pairing_chat
 from integration_lab.scenarios.burst_chat import run_burst_chat
+from integration_lab.scenarios.fixed_rate_chat import run_fixed_rate_chat
+from integration_lab.scenarios.mixed_payload_chat import run_mixed_payload_chat
 from integration_lab.scenarios.bluetooth_recovery_chat import run_bluetooth_recovery_chat
 from integration_lab.scenarios.duplicate_link_chat import run_duplicate_link_chat
 from integration_lab.scenarios.restart_chat import run_restart_chat
@@ -106,6 +108,9 @@ def _build(platforms: set[str]) -> dict[str, Path]:
     if "ios" in platforms:
         _command(["flutter", "build", "ios", "--debug"])
         artifacts["ios"] = ROOT / "build/ios/iphoneos/Runner.app"
+    if "macos" in platforms:
+        _command(["flutter", "build", "macos", "--debug"])
+        artifacts["macos"] = ROOT / "build/macos/Build/Products/Debug/local_peer_messages.app"
     for platform, artifact in artifacts.items():
         if not artifact.exists():
             raise RuntimeError(f"expected {platform} artifact missing: {artifact}")
@@ -167,12 +172,17 @@ def main() -> int:
             "removed_friend_authorization",
             "restart_chat",
             "burst_chat",
+            "fixed_rate_chat",
+            "mixed_payload_chat",
             "duplicate_link_chat",
             "bluetooth_recovery_chat",
         ],
         default="pairing_chat",
     )
     parser.add_argument("--timeout", type=float, default=90)
+    parser.add_argument("--traffic-seconds", type=int, default=30)
+    parser.add_argument("--message-size", type=int, default=64)
+    parser.add_argument("--messages-per-second", type=float, default=5)
     parser.add_argument("--artifacts-dir", type=Path, default=ROOT / "artifacts")
     parser.add_argument("--skip-build", action="store_true")
     options = parser.parse_args()
@@ -186,8 +196,11 @@ def main() -> int:
         if len(matches) != 1:
             raise RuntimeError(f"inventory must contain exactly one {role} device")
         selected.append(matches[0])
-    if not {config.platform for config in selected}.issuperset({"android", "ios"}):
-        raise RuntimeError("the integration scenario requires Android and iOS participants")
+    selected_platforms = {config.platform for config in selected}
+    if "android" not in selected_platforms or not selected_platforms.intersection(
+        {"ios", "macos"}
+    ):
+        raise RuntimeError("the integration scenario requires Android plus iOS or macOS")
     primary = next(config for config in selected if config.role == "primary")
     secondary = next(config for config in selected if config.role == "secondary")
     tertiary = next((config for config in selected if config.role == "tertiary"), None)
@@ -207,10 +220,19 @@ def main() -> int:
         with ExitStack() as lock_stack:
             for lock, config in zip(locks, selected):
                 lock_stack.enter_context(_device_lock(lock, config.name))
-            artifacts = _build({config.platform for config in selected}) if not options.skip_build else {
-                "android": ROOT / "build/app/outputs/flutter-apk/app-debug.apk",
-                "ios": ROOT / "build/ios/iphoneos/Runner.app",
-            }
+            artifacts = (
+                _build(selected_platforms)
+                if not options.skip_build
+                else {
+                    platform: path
+                    for platform, path in {
+                        "android": ROOT / "build/app/outputs/flutter-apk/app-debug.apk",
+                        "ios": ROOT / "build/ios/iphoneos/Runner.app",
+                        "macos": ROOT / "build/macos/Build/Products/Debug/local_peer_messages.app",
+                    }.items()
+                    if platform in selected_platforms
+                }
+            )
             for device in devices.values():
                 device.prepare(artifacts[device.config.platform])
                 controls[device.name] = AppControl(
@@ -320,6 +342,20 @@ def main() -> int:
                 outcome = run_burst_chat(
                     controls, primary.name, secondary.name, options.timeout
                 )
+            elif options.scenario == "fixed_rate_chat":
+                outcome = run_fixed_rate_chat(
+                    controls,
+                    primary.name,
+                    secondary.name,
+                    options.timeout,
+                    message_size=options.message_size,
+                    messages_per_second=options.messages_per_second,
+                    duration_seconds=options.traffic_seconds,
+                )
+            elif options.scenario == "mixed_payload_chat":
+                outcome = run_mixed_payload_chat(
+                    controls, primary.name, secondary.name, options.timeout
+                )
             elif options.scenario == "duplicate_link_chat":
                 outcome = run_duplicate_link_chat(
                     controls, primary.name, secondary.name, options.timeout
@@ -337,6 +373,21 @@ def main() -> int:
         print(f"Scenario failed: {error}", file=sys.stderr, flush=True)
         return_code = 1
     finally:
+        # Every physical scenario is a transaction over the installed app.
+        # Reset app-level state before collecting the final snapshot so a
+        # successful run never leaves friendships, groups, or queued traffic
+        # in the next scenario's identity-preserving installation. This also
+        # exercises the app's idempotent LPC ownership cleanup on failures.
+        cleanup_errors: list[str] = []
+        for name, control in controls.items():
+            try:
+                control.command("resetTestState", timeout=30)
+            except Exception as error:  # cleanup must not hide diagnostics
+                cleanup_errors.append(f"{name}: {error}")
+        if cleanup_errors:
+            result["cleanupError"] = "; ".join(cleanup_errors)
+            result["status"] = "failed"
+            return_code = 1
         for name, control in controls.items():
             try:
                 _write_json(artifact_dir / f"{name}.snapshot.json", control.snapshot())

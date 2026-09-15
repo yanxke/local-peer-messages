@@ -16,6 +16,38 @@ def _has_ready_peer(snapshot: dict[str, Any], peer_id: str) -> bool:
     )
 
 
+def _wait_for_stable_ready(
+    first: Any,
+    second: Any,
+    first_peer_id: str,
+    second_peer_id: str,
+    timeout: float,
+    stable_seconds: float = 5.0,
+) -> None:
+    """Wait until both sides stay READY across the post-toggle handoff."""
+    deadline = time.monotonic() + timeout
+    stable_since: float | None = None
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        left = first.snapshot()
+        right = second.snapshot()
+        last = {"primary": left, "secondary": right}
+        ready = _has_ready_peer(left, second_peer_id) and _has_ready_peer(
+            right, first_peer_id
+        )
+        if ready:
+            stable_since = stable_since or time.monotonic()
+            if time.monotonic() - stable_since >= stable_seconds:
+                return
+        else:
+            stable_since = None
+        time.sleep(0.25)
+    raise ControlError(
+        "both peers did not remain READY after Bluetooth recovery; "
+        f"last snapshot={last}"
+    )
+
+
 def run_bluetooth_recovery_chat(
     controls: dict[str, AppControl],
     devices: dict[str, Device],
@@ -64,21 +96,13 @@ def run_bluetooth_recovery_chat(
         "Android runtime/discovery after Bluetooth recovery",
         timeout,
     )
-    first.wait_for(
-        lambda snapshot: _has_ready_peer(snapshot, secondary_peer_id),
-        "primary automatic reconnect after Bluetooth recovery",
+    _wait_for_stable_ready(
+        first,
+        second,
+        primary_peer_id,
+        secondary_peer_id,
         timeout,
     )
-    second.wait_for(
-        lambda snapshot: _has_ready_peer(snapshot, primary_peer_id),
-        "secondary automatic reconnect after Bluetooth recovery",
-        timeout,
-    )
-    # A ready snapshot means the logical peer is usable, but the platform
-    # transport may still be completing its first post-recovery frame flush.
-    # Give both runtimes a short stable interval before exercising messaging;
-    # otherwise this test can race the terminal close of the old GATT session.
-    time.sleep(5)
 
     alpha = f"bluetooth-alpha-{int(time.time())}"
     alpha_hash = hashlib.sha256(alpha.encode()).hexdigest()

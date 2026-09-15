@@ -11,6 +11,36 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'integration_control.dart';
 
+// LPM is an independent harness from LPC and LPGE. Use a stable, application
+// specific BLE service namespace so its endpoints are not discovered by the
+// other harnesses. LPC derives the RX/TX/control UUIDs from this service UUID.
+const _lpmHarnessServiceUuid = <int>[
+  0x83,
+  0xf2,
+  0x0a,
+  0x20,
+  0x8c,
+  0x5a,
+  0x4f,
+  0x5a,
+  0x9a,
+  0x3a,
+  0x2f,
+  0x0d,
+  0x7a,
+  0x96,
+  0xb1,
+  0x00,
+];
+
+// Keep LPM's debug control socket distinct from other app harnesses
+// when multiple apps are installed on the same device. Override with
+// --dart-define=LPM_TEST_PORT=<port> for a custom deployment.
+const _lpmHarnessControlPort = int.fromEnvironment(
+  'LPM_TEST_PORT',
+  defaultValue: 8766,
+);
+
 const _friendRequest = 1,
     _friendAccept = 2,
     _friendReject = 3,
@@ -77,6 +107,8 @@ class _MessagingPageState extends State<MessagingPage> {
   IntegrationControlServer? _integrationControl;
   Timer? _endpointExpiryTimer;
   final _peerSubs = <StreamSubscription<dynamic>>[];
+  final _peerEventSubs = <String, StreamSubscription<dynamic>>{};
+  final _peerMessageSubs = <String, StreamSubscription<dynamic>>{};
   final _pendingFriendDecisions = <String, Completer<bool>>{};
   final _pendingGroupInvites = <String, _PendingGroupInvite>{};
   String _name = '';
@@ -98,6 +130,7 @@ class _MessagingPageState extends State<MessagingPage> {
       snapshot: _integrationSnapshot,
       command: _integrationCommand,
       logger: _log,
+      port: _lpmHarnessControlPort,
     );
     _integrationControl = control;
     try {
@@ -526,6 +559,8 @@ class _MessagingPageState extends State<MessagingPage> {
       await subscription.cancel();
     }
     _peerSubs.clear();
+    _peerEventSubs.clear();
+    _peerMessageSubs.clear();
     await ignoreFailure('runtime.close', () async {
       await _runtime?.close();
     });
@@ -608,6 +643,7 @@ class _MessagingPageState extends State<MessagingPage> {
         platformBleBackend: backend,
         identityStore: identityStore,
         config: RuntimeConfig(
+          serviceUuid: _lpmHarnessServiceUuid,
           discoveryDisplayName: _name,
           applicationMetadata: _metadata(_name),
           trustMode: HandshakeTrustMode.tofu,
@@ -624,8 +660,13 @@ class _MessagingPageState extends State<MessagingPage> {
           // presence and for the coexistence integration test.
           autoConnectKnownPeers: true,
           knownPeerResolver: _Resolver(_friends),
-          maxConcurrentKnownPeerProbes: 4,
-          maxPendingKnownPeerProbes: 64,
+          // A phone/tablet can expose several rotating GATT candidates while
+          // another peer is reconnecting. Four simultaneous identity probes
+          // can consume the native BLE connection budget and flap an otherwise
+          // healthy link. Keep the probing symmetric, but apply the same
+          // bounded backpressure as the sibling LPC embedding.
+          maxConcurrentKnownPeerProbes: 2,
+          maxPendingKnownPeerProbes: 16,
           knownPeerLookupTimeoutMs: 2000,
           maxKnownPeerCacheEntries: 256,
           enableGatt: true,
@@ -879,9 +920,22 @@ class _MessagingPageState extends State<MessagingPage> {
 
   void _attach(PeerConnection peer, String source) {
     final id = peer.peerId.toString();
+    // LPC may finish publishing a candidate event after the bounded probe has
+    // already closed that candidate. Do not let a terminal object replace a
+    // READY/RECONNECTING application connection.
+    if (peer.state == PeerConnectionState.disconnected) {
+      _log('Ignoring disconnected peer attach peer=$id source=$source');
+      return;
+    }
     if (_connections[id] == peer) {
       _log('Ignoring duplicate attach peer=$id source=$source');
       return;
+    }
+    final previous = _connections[id];
+    if (previous != null) {
+      _log('Replacing peer attachment peer=$id source=$source');
+      _cancelPeerSubscriptions(id);
+      _endpointPeers.removeWhere((_, candidate) => candidate == previous);
     }
     _connections[id] = peer;
     final name = _decodeMetadata(peer.remoteApplicationMetadata);
@@ -894,58 +948,74 @@ class _MessagingPageState extends State<MessagingPage> {
     _log(
       '$source $id; security=${peer.securityLevel.name}; human name=${name ?? 'unusable'}',
     );
-    _peerSubs.add(
-      peer.events.listen((e) {
-        // A known-peer probe can establish a replacement logical connection
-        // while the previous one is still inside LPC's bounded RESUME window.
-        // Events from that superseded connection must not overwrite the
-        // replacement's presence or remove it from the map when its expiry
-        // eventually produces PeerDisconnected.
+    late final StreamSubscription<dynamic> eventSubscription;
+    eventSubscription = peer.events.listen((e) {
+      // A known-peer probe can establish a replacement logical connection
+      // while the previous one is still inside LPC's bounded RESUME window.
+      // Events from that superseded connection must not overwrite the
+      // replacement's presence or remove it from the map when its expiry
+      // eventually produces PeerDisconnected.
+      if (_connections[id] != peer) {
+        _log('Ignoring stale peer event peer=$id event=${e.runtimeType}');
+        return;
+      }
+      _log(
+        'Peer event peer=$id event=${e.runtimeType} state=${peer.state.name}',
+      );
+      if (e is PeerReconnecting)
+        _presence(id, _Presence.reconnecting, 'PeerReconnecting');
+      if (e is PeerReconnected)
+        _presence(id, _Presence.online, 'PeerReconnected ${e.transport.name}');
+      if (e is PeerDisconnected) {
+        _connections.remove(id);
+        _cancelPeerSubscriptions(id);
+        final endpointIds = _endpointPeers.entries
+            .where((entry) => entry.value == peer)
+            .map((entry) => entry.key)
+            .toList(growable: false);
+        for (final endpointId in endpointIds) {
+          _endpointPeers.remove(endpointId);
+          _endpointSeenAt.remove(endpointId);
+          _nearby.remove(endpointId);
+          _unnamedNearby.remove(endpointId);
+          _identifiedEndpointNames.remove(endpointId);
+          _identifyingEndpoints.remove(endpointId);
+        }
+        _presence(id, _Presence.offline, 'PeerDisconnected');
+      }
+    });
+    _peerEventSubs[id] = eventSubscription;
+    _peerSubs.add(eventSubscription);
+    late final StreamSubscription<dynamic> messageSubscription;
+    messageSubscription = peer.messages.listen(
+      (m) {
         if (_connections[id] != peer) {
-          _log('Ignoring stale peer event peer=$id event=${e.runtimeType}');
+          _log('Ignoring stale peer message peer=$id');
           return;
         }
-        _log(
-          'Peer event peer=$id event=${e.runtimeType} state=${peer.state.name}',
-        );
-        if (e is PeerReconnecting)
-          _presence(id, _Presence.reconnecting, 'PeerReconnecting');
-        if (e is PeerReconnected)
-          _presence(
-            id,
-            _Presence.online,
-            'PeerReconnected ${e.transport.name}',
-          );
-        if (e is PeerDisconnected) {
-          _connections.remove(id);
-          final endpointIds = _endpointPeers.entries
-              .where((entry) => entry.value == peer)
-              .map((entry) => entry.key)
-              .toList(growable: false);
-          for (final endpointId in endpointIds) {
-            _endpointPeers.remove(endpointId);
-            _endpointSeenAt.remove(endpointId);
-            _nearby.remove(endpointId);
-            _unnamedNearby.remove(endpointId);
-            _identifiedEndpointNames.remove(endpointId);
-            _identifyingEndpoints.remove(endpointId);
-          }
-          _presence(id, _Presence.offline, 'PeerDisconnected');
-        }
-      }),
+        _log('Peer message received peer=$id bytes=${m.bytes.length}');
+        unawaited(_receive(peer, m));
+      },
+      onError: (Object error, StackTrace stack) {
+        _log('Peer message stream error peer=$id error=$error');
+      },
     );
-    _peerSubs.add(
-      peer.messages.listen(
-        (m) {
-          _log('Peer message received peer=$id bytes=${m.bytes.length}');
-          unawaited(_receive(peer, m));
-        },
-        onError: (Object error, StackTrace stack) {
-          _log('Peer message stream error peer=$id error=$error');
-        },
-      ),
-    );
+    _peerMessageSubs[id] = messageSubscription;
+    _peerSubs.add(messageSubscription);
     if (mounted) setState(() {});
+  }
+
+  void _cancelPeerSubscriptions(String id) {
+    final eventSubscription = _peerEventSubs.remove(id);
+    final messageSubscription = _peerMessageSubs.remove(id);
+    if (eventSubscription != null) {
+      _peerSubs.remove(eventSubscription);
+      unawaited(eventSubscription.cancel());
+    }
+    if (messageSubscription != null) {
+      _peerSubs.remove(messageSubscription);
+      unawaited(messageSubscription.cancel());
+    }
   }
 
   void _presence(String id, _Presence p, String what) {

@@ -6,7 +6,7 @@ import uuid
 from typing import Any
 
 from integration_lab.control import AppControl, ControlError
-from integration_lab.scenarios.group_chat import run_group_chat
+from integration_lab.scenarios.group_chat import _converged, run_group_chat
 from integration_lab.scenarios.pairing_chat import _friend, _has_ready_peer
 
 
@@ -96,9 +96,13 @@ def run_coexistence_chat(
         timeout,
     )
     first.command("acceptGroupInvite", {"peerId": secondary_peer_id})
+    # `state == ready` only means that one local GroupSession has committed a
+    # membership.  Removing friendship before both sides have converged can
+    # legitimately release the direct/known-peer owner while the group still
+    # has singleton membership, which makes this test race its own setup.
     first.wait_for(
-        lambda snapshot: snapshot.get("group", {}).get("state") == "ready",
-        "second Group Demo ready before friendship removal",
+        lambda snapshot: _converged(snapshot, second.snapshot()),
+        "second Group Demo shared coordinator before friendship removal",
         timeout,
     )
     first.command("removeFriendLocalOnly", {"peerId": secondary_peer_id})

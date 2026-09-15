@@ -6,17 +6,18 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-APP_CONTROL_PORT = 8765
+APP_CONTROL_PORT = 8766
 ANDROID_PACKAGE = "com.example.local_peer_messages"
-ANDROID_LPC_FIXTURE_PACKAGE = "com.example.integration_device_app"
 IOS_BUNDLE_ID = "com.example.localPeerMessages"
-IOS_LPC_FIXTURE_BUNDLE_ID = "com.example.integrationDeviceApp"
+MACOS_BUNDLE_ID = "com.example.localPeerMessages"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class DeviceError(RuntimeError):
@@ -170,11 +171,7 @@ class AndroidDevice(Device):
     def prepare(self, artifact: Path) -> None:
         if not self.connected():
             raise DeviceError(f"{self.name}: device is not connected and authorized")
-        # Keep the messenger run isolated from the standalone LPC fixture.
-        # Both apps advertise the same LPC service, so leaving the fixture
-        # alive creates indistinguishable nearby endpoints and endpoint-busy
-        # races on the peer under test.
-        self._adb("shell", "am", "force-stop", ANDROID_LPC_FIXTURE_PACKAGE)
+        # Keep lifecycle operations scoped to this application's package.
         self.install(artifact)
         self.wake()
         self.launch()
@@ -416,7 +413,6 @@ class IosDevice(Device):
         # to an old process while the new flutter tool is still starting, and
         # its delayed "Exiting..." output is easy to misread as this launch.
         self._stop_orphan_flutter_launchers()
-        self._terminate_installed_bundle(IOS_LPC_FIXTURE_BUNDLE_ID)
         self._terminate_installed_bundle(IOS_BUNDLE_ID)
 
         # iOS refuses to launch a debug Flutter app through devicectl; it must
@@ -675,9 +671,125 @@ class IosDevice(Device):
         return data
 
 
+class MacosDevice(Device):
+    """Run the debug app locally while preserving the same control API."""
+
+    def __init__(self, config: DeviceConfig, host_port: int):
+        super().__init__(config, host_port)
+        # Unlike mobile participants, the macOS participant is the test host;
+        # its loopback control server is reached directly, not through a USB
+        # forward allocated by the runner.
+        self.host_port = APP_CONTROL_PORT
+        self._artifact: Path | None = None
+        self._log_path: Path | None = None
+        self._log_file: Any = None
+
+    def connected(self) -> bool:
+        return sys.platform == "darwin"
+
+    def install(self, artifact: Path) -> None:
+        # The macOS participant is this host. The runner launches the freshly
+        # built bundle directly and never installs/uninstalls application data.
+        self._artifact = artifact
+
+    @property
+    def _executable(self) -> Path:
+        if self._artifact is None:
+            raise DeviceError(f"{self.name}: macOS artifact is not prepared")
+        executable = self._artifact / "Contents" / "MacOS" / "local_peer_messages"
+        if not executable.exists():
+            raise DeviceError(f"{self.name}: macOS executable missing: {executable}")
+        return executable
+
+    def _stop_existing(self) -> None:
+        executable = self._executable
+        result = subprocess.run(
+            ["pgrep", "-f", str(executable)],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        for raw_pid in result.stdout.splitlines():
+            try:
+                pid = int(raw_pid)
+            except ValueError:
+                continue
+            if pid == os.getpid():
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            for _ in range(20):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.1)
+            else:
+                # A Flutter desktop process can remain in graceful shutdown
+                # while its Dart engine tears down LPC. Do not launch a new
+                # copy into the same control port until this exact executable
+                # is gone; force only this app after the bounded grace period.
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def launch(self) -> None:
+        executable = self._executable
+        self._stop_existing()
+        self._log_path = Path(f"/tmp/integration-lab-macos-{self.host_port}.log")
+        self._log_file = self._log_path.open("w", encoding="utf-8")
+        self._launcher_process = subprocess.Popen(
+            [str(executable)],
+            cwd=PROJECT_ROOT,
+            stdout=self._log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+    def stop(self) -> None:
+        if self._launcher_process is not None:
+            self.close()
+            return
+        self._stop_existing()
+
+    def restart(self, artifact: Path) -> None:
+        self.stop()
+        self.install(artifact)
+        self.launch()
+
+    def set_bluetooth_enabled(self, enabled: bool) -> None:
+        raise DeviceError("macOS Bluetooth power control is not available through the lab")
+
+    def start_bridge(self) -> None:
+        # The macOS app's loopback control server is already reachable directly.
+        return
+
+    def collect_logs(self, output: Path) -> None:
+        if self._log_path is not None and self._log_path.exists():
+            output.write_text(self._log_path.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            super().collect_logs(output)
+
+    def close(self) -> None:
+        super().close()
+        if self._log_file is not None:
+            self._log_file.close()
+            self._log_file = None
+
+    def metadata(self) -> dict[str, Any]:
+        data = super().metadata()
+        data.update({"bundleId": MACOS_BUNDLE_ID, "hostParticipant": True})
+        return data
+
+
 def make_device(config: DeviceConfig, host_port: int) -> Device:
     if config.platform == "android":
         return AndroidDevice(config, host_port)
     if config.platform == "ios":
         return IosDevice(config, host_port)
+    if config.platform == "macos":
+        return MacosDevice(config, host_port)
     raise DeviceError(f"{config.name}: unsupported platform {config.platform}")
