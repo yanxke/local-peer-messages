@@ -39,7 +39,7 @@ dependencies:
   local_peer_connections:
     git:
       url: https://github.com/yanxke/local-peer-connections.git
-      ref: yan/v1
+      ref: main
 
   # Local development override: comment the Git dependency above and
   # uncomment this path dependency when editing the sibling checkout.

@@ -1142,3 +1142,11 @@ observe LPC coordinator/relay/transport behavior in Diagnostics
 ```
 
 If implementing a feature requires durable distributed messaging state, persistent multi-room orchestration, production authorization, or cloud-messenger semantics, it is probably outside this demo specification unless it is directly necessary to expose or verify LPC behavior.
+
+---
+
+# 38. Android Build Toolchain and LPC Dependency
+
+Android builds MUST use the Gradle 9.3.1 wrapper with Android Gradle Plugin 9.1.0 and Java 17. The build MUST enable Android Gradle Plugin built-in Kotlin support and target JVM 17. Kotlin Gradle Plugin 2.4.0 remains declared for Flutter's dependency-version validation but MUST NOT be applied to the app module. Keep `android.newDsl=false` while the Flutter Gradle plugin uses the legacy Android extension.
+
+The app MUST resolve `local_peer_connections` from the Git branch `main` and lock a compatible branch revision in `pubspec.lock`. That revision MUST expose the optional diagnostic callbacks used by the messenger through `PlatformBleBackend.logger` and `RuntimeConfig.logger`. Android Flutter plugins MUST support AGP 9 built-in Kotlin; in particular, resolve `shared_preferences_android` to 2.4.24 or newer. Startup retry diagnostics MUST log the non-null LPC exception message directly.

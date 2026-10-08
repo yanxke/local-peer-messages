@@ -746,13 +746,8 @@ class _MessagingPageState extends State<MessagingPage> {
           rethrow;
         }
         _log(
-          'Nearby startup retry ' +
-              (attempt + 1).toString() +
-              '/10: ' +
-              error.code.name +
-              ' (' +
-              (error.message ?? error.toString()) +
-              ')',
+          'Nearby startup retry ${attempt + 1}/10: '
+          '${error.code.name} (${error.message})',
         );
         await Future<void>.delayed(const Duration(milliseconds: 500));
       }

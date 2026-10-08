@@ -9,10 +9,11 @@ flutter pub get
 flutter run
 ```
 
-The app follows the `yan/v1` branch at https://github.com/yanxke/local-peer-connections.
+The app follows the `main` branch at https://github.com/yanxke/local-peer-connections.
 
-If the Git branch advances, run `flutter pub get` to refresh the dependency. To
-validate unreleased plugin edits, use the local path override below.
+`flutter pub get` installs the revision locked in `pubspec.lock`. To update to
+the current `main` branch revision, run `flutter pub upgrade local_peer_connections`.
+To validate unreleased plugin edits, use the local path override below.
 
 ## Run against a local checkout
 
